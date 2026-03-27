@@ -16,14 +16,13 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel
 
 # --- Configuration ---
-MONGO_URI = os.environ.get(
-    "MONGO_URI",
-    "mongodb+srv://gustavomaiasilva25_db_user:gustavo992499MA@cluster0.h18sdsg.mongodb.net/?appName=Cluster0",
-)
-MASTER_KEY = os.environ.get(
-    "MASTER_KEY",
-    "8_L8P1y7p_Z8J5wR4-hD7_nN2jL_x3z4_U5i6_G7_89=",
-)
+MONGO_URI = os.environ.get("MONGO_URI", "")
+MASTER_KEY = os.environ.get("MASTER_KEY", "")
+
+if not MONGO_URI:
+    raise RuntimeError("MONGO_URI environment variable is required. Set it before starting the server.")
+if not MASTER_KEY:
+    raise RuntimeError("MASTER_KEY environment variable is required. Set it before starting the server.")
 JWT_SECRET = os.environ.get("JWT_SECRET", secrets.token_urlsafe(64))
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_HOURS = 24
