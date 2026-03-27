@@ -1,0 +1,373 @@
+"""Medical Safe Gold - Secure Backend API"""
+
+import os
+import secrets
+import base64
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+import bcrypt
+from cryptography.fernet import Fernet
+from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi.middleware.cors import CORSMiddleware
+from jose import jwt, JWTError
+from motor.motor_asyncio import AsyncIOMotorClient
+from pydantic import BaseModel, EmailStr
+
+# --- Configuration ---
+MONGO_URI = os.environ.get(
+    "MONGO_URI",
+    "mongodb+srv://gustavomaiasilva25_db_user:gustavo992499MA@cluster0.h18sdsg.mongodb.net/?appName=Cluster0",
+)
+MASTER_KEY = os.environ.get(
+    "MASTER_KEY",
+    "8_L8P1y7p_Z8J5wR4-hD7_nN2jL_x3z4_U5i6_G7_89=",
+)
+JWT_SECRET = os.environ.get("JWT_SECRET", secrets.token_urlsafe(64))
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_HOURS = 24
+TRIAL_DAYS = 7
+DB_NAME = "medical_safe_gold"
+
+# --- App ---
+app = FastAPI(title="Medical Safe Gold API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Database ---
+client: Optional[AsyncIOMotorClient] = None
+db = None
+
+
+@app.on_event("startup")
+async def startup_db():
+    global client, db
+    client = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+    db = client[DB_NAME]
+    # Ensure indexes
+    await db.users.create_index("email", unique=True)
+    await db.agendamentos.create_index("clinica_id")
+
+
+@app.on_event("shutdown")
+async def shutdown_db():
+    global client
+    if client:
+        client.close()
+
+
+# --- Models ---
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+    machine_id: str
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+    machine_id: str
+
+
+class AppointmentSave(BaseModel):
+    payload: str  # Already encrypted by the client
+    clinica_id: str
+
+
+class AppointmentDelete(BaseModel):
+    id: str
+    clinica_id: str
+
+
+class SubscriptionActivate(BaseModel):
+    email: str
+    plan: str  # "monthly" or "annual"
+    transaction_id: str
+
+
+class AuthResponse(BaseModel):
+    success: bool
+    token: Optional[str] = None
+    fernet_key: Optional[str] = None
+    clinica_id: Optional[str] = None
+    subscription_status: Optional[str] = None
+    subscription_plan: Optional[str] = None
+    subscription_expires: Optional[str] = None
+    error: Optional[str] = None
+
+
+# --- Helpers ---
+def generate_user_fernet_key() -> str:
+    """Generate a unique Fernet key for a new user."""
+    return Fernet.generate_key().decode()
+
+
+def encrypt_user_key(user_key: str) -> str:
+    """Encrypt a user's Fernet key with the master key for storage."""
+    f = Fernet(MASTER_KEY.encode() if isinstance(MASTER_KEY, str) else MASTER_KEY)
+    return f.encrypt(user_key.encode()).decode()
+
+
+def decrypt_user_key(encrypted_key: str) -> str:
+    """Decrypt a user's Fernet key from storage."""
+    f = Fernet(MASTER_KEY.encode() if isinstance(MASTER_KEY, str) else MASTER_KEY)
+    return f.decrypt(encrypted_key.encode()).decode()
+
+
+def create_jwt_token(email: str) -> str:
+    """Create a JWT token for authenticated sessions."""
+    expire = datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRE_HOURS)
+    payload = {"sub": email, "exp": expire}
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+async def verify_token(authorization: str = Header(...)) -> str:
+    """Verify JWT token from Authorization header."""
+    try:
+        token = authorization.replace("Bearer ", "")
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        email = payload.get("sub")
+        if not email:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return email
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+
+def check_subscription(user: dict) -> tuple[bool, str]:
+    """Check if user has active subscription. Returns (is_active, status)."""
+    status = user.get("subscription_status", "trial")
+    expires = user.get("subscription_expires")
+
+    if status == "trial":
+        if expires and datetime.now(timezone.utc) > expires.replace(tzinfo=timezone.utc):
+            return False, "trial_expired"
+        return True, "trial"
+
+    if status == "active":
+        if expires and datetime.now(timezone.utc) > expires.replace(tzinfo=timezone.utc):
+            return False, "expired"
+        return True, "active"
+
+    return False, status
+
+
+# --- Auth Endpoints ---
+@app.post("/auth/register", response_model=AuthResponse)
+async def register(req: RegisterRequest):
+    """Register a new user with unique encryption key and 7-day trial."""
+    if not req.email or not req.password:
+        return AuthResponse(success=False, error="MISSING_FIELDS")
+
+    email = req.email.strip().lower()
+
+    # Check if user exists
+    existing = await db.users.find_one({"email": email})
+    if existing:
+        return AuthResponse(success=False, error="USER_EXISTS")
+
+    # Hash password
+    password_hash = bcrypt.hashpw(req.password.encode(), bcrypt.gensalt(10))
+
+    # Generate unique Fernet key for this user
+    user_fernet_key = generate_user_fernet_key()
+    encrypted_fernet_key = encrypt_user_key(user_fernet_key)
+
+    # Calculate trial expiration (7 days)
+    trial_expires = datetime.now(timezone.utc) + timedelta(days=TRIAL_DAYS)
+
+    # Create user
+    await db.users.insert_one({
+        "email": email,
+        "password_hash": password_hash.decode() if isinstance(password_hash, bytes) else password_hash,
+        "machine_id": req.machine_id,
+        "fernet_key_encrypted": encrypted_fernet_key,
+        "subscription_status": "trial",
+        "subscription_plan": None,
+        "subscription_expires": trial_expires,
+        "created_at": datetime.now(timezone.utc),
+        "last_login": datetime.now(timezone.utc),
+    })
+
+    token = create_jwt_token(email)
+
+    return AuthResponse(
+        success=True,
+        token=token,
+        fernet_key=user_fernet_key,
+        clinica_id=email,
+        subscription_status="trial",
+        subscription_expires=trial_expires.isoformat(),
+    )
+
+
+@app.post("/auth/login", response_model=AuthResponse)
+async def login(req: LoginRequest):
+    """Login with email/password, returns JWT + user's Fernet key."""
+    email = req.email.strip().lower()
+
+    user = await db.users.find_one({"email": email})
+    if not user:
+        return AuthResponse(success=False, error="USER_NOT_FOUND")
+
+    # Verify password
+    stored_hash = user["password_hash"]
+    if isinstance(stored_hash, str):
+        stored_hash = stored_hash.encode()
+
+    if not bcrypt.checkpw(req.password.encode(), stored_hash):
+        return AuthResponse(success=False, error="WRONG_PASSWORD")
+
+    # Check subscription
+    is_active, status = check_subscription(user)
+    if not is_active:
+        return AuthResponse(
+            success=False,
+            error="SUBSCRIPTION_EXPIRED",
+            subscription_status=status,
+        )
+
+    # Decrypt user's Fernet key
+    try:
+        user_fernet_key = decrypt_user_key(user["fernet_key_encrypted"])
+    except Exception:
+        # Legacy user without per-user key - generate one now
+        user_fernet_key = generate_user_fernet_key()
+        encrypted_key = encrypt_user_key(user_fernet_key)
+        await db.users.update_one(
+            {"_id": user["_id"]},
+            {"$set": {"fernet_key_encrypted": encrypted_key}},
+        )
+
+    # Update last login
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"last_login": datetime.now(timezone.utc), "machine_id": req.machine_id}},
+    )
+
+    token = create_jwt_token(email)
+
+    return AuthResponse(
+        success=True,
+        token=token,
+        fernet_key=user_fernet_key,
+        clinica_id=email,
+        subscription_status=user.get("subscription_status", "trial"),
+        subscription_plan=user.get("subscription_plan"),
+        subscription_expires=user.get("subscription_expires", "").isoformat()
+        if user.get("subscription_expires")
+        else None,
+    )
+
+
+# --- Appointment Endpoints ---
+@app.post("/appointments")
+async def save_appointment(data: AppointmentSave, email: str = Depends(verify_token)):
+    """Save an encrypted appointment."""
+    result = await db.agendamentos.insert_one({
+        "payload": data.payload,
+        "clinica_id": data.clinica_id,
+    })
+    return {"success": True, "id": str(result.inserted_id)}
+
+
+@app.get("/appointments/{clinica_id}")
+async def get_appointments(clinica_id: str, email: str = Depends(verify_token)):
+    """Get all encrypted appointments for a clinic."""
+    docs = await db.agendamentos.find({"clinica_id": clinica_id}).to_list(length=10000)
+    results = []
+    for doc in docs:
+        results.append({
+            "id": str(doc["_id"]),
+            "payload": doc["payload"],
+        })
+    return {"success": True, "data": results}
+
+
+@app.delete("/appointments/{appointment_id}")
+async def delete_appointment(
+    appointment_id: str,
+    clinica_id: str,
+    email: str = Depends(verify_token),
+):
+    """Delete an appointment by ID."""
+    from bson import ObjectId
+
+    await db.agendamentos.delete_one({
+        "_id": ObjectId(appointment_id),
+        "clinica_id": clinica_id,
+    })
+    return {"success": True}
+
+
+# --- Subscription Endpoints ---
+@app.post("/subscription/activate")
+async def activate_subscription(data: SubscriptionActivate):
+    """Activate a subscription (called by Mercado Pago webhook or admin)."""
+    email = data.email.strip().lower()
+    user = await db.users.find_one({"email": email})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if data.plan == "monthly":
+        expires = datetime.now(timezone.utc) + timedelta(days=30)
+    elif data.plan == "annual":
+        expires = datetime.now(timezone.utc) + timedelta(days=365)
+    else:
+        raise HTTPException(status_code=400, detail="Invalid plan")
+
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {
+            "$set": {
+                "subscription_status": "active",
+                "subscription_plan": data.plan,
+                "subscription_expires": expires,
+                "last_transaction_id": data.transaction_id,
+            }
+        },
+    )
+
+    return {"success": True, "expires": expires.isoformat()}
+
+
+@app.get("/subscription/status/{user_email}")
+async def subscription_status(user_email: str, email: str = Depends(verify_token)):
+    """Check subscription status."""
+    target_email = user_email.strip().lower()
+    user = await db.users.find_one({"email": target_email})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    is_active, status = check_subscription(user)
+
+    return {
+        "active": is_active,
+        "status": status,
+        "plan": user.get("subscription_plan"),
+        "expires": user.get("subscription_expires", "").isoformat()
+        if user.get("subscription_expires")
+        else None,
+    }
+
+
+# --- Health ---
+@app.get("/health")
+async def health():
+    """Health check endpoint."""
+    try:
+        await client.admin.command("ping")
+        return {"status": "ok", "database": "connected"}
+    except Exception:
+        return {"status": "ok", "database": "disconnected"}
+
+
+@app.get("/")
+async def root():
+    return {"app": "Medical Safe Gold API", "version": "1.0.0", "status": "running"}

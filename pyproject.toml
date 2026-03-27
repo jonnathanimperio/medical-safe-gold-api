@@ -1,0 +1,21 @@
+[tool.poetry]
+name = "medical-safe-gold-api"
+version = "0.1.0"
+description = "Secure backend API for Medical Safe Gold"
+authors = ["Jonnathan Coelho Silva"]
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.10"
+fastapi = {extras = ["standard"], version = "^0.135.2"}
+uvicorn = {version = ">=0.30.0,<1.0.0", extras = ["standard"]}
+motor = ">=3.3.0,<4.0.0"
+bcrypt = ">=4.0.0,<6.0.0"
+cryptography = ">=42.0.0,<48.0.0"
+pydantic = {version = ">=2.0.0,<3.0.0", extras = ["email"]}
+python-jose = {version = ">=3.3.0,<4.0.0", extras = ["cryptography"]}
+python-multipart = "^0.0.22"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
