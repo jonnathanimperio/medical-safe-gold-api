@@ -3,6 +3,7 @@
 import os
 import csv
 import io
+import asyncio
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -204,13 +205,27 @@ def generate_license_key() -> str:
     return "-".join(parts)
 
 
+def _send_email_sync(to_email, subject, html_body):
+    """Synchronous email sending - runs in thread pool."""
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = SMTP_FROM
+    msg["To"] = to_email
+    msg.attach(MIMEText(html_body, "html"))
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASSWORD)
+        server.sendmail(SMTP_FROM, to_email, msg.as_string())
+    return True
+
+
 async def send_license_email(to_email, license_key, plan):
     if not SMTP_USER or not SMTP_PASSWORD:
         return False
     try:
-        import smtplib
-        from email.mime.text import MIMEText
-        from email.mime.multipart import MIMEMultipart
         plan_name = "Mensal (R$ 69/mes)" if plan == "monthly" else "Anual (R$ 549/ano)"
         html = '<div style="font-family:Arial;max-width:600px;margin:0 auto;background:#0a0a0f;color:#fff;padding:30px;border-radius:12px;">'
         html += '<div style="text-align:center;margin-bottom:30px;"><h1 style="color:#d4af37;">Medical Safe Gold</h1><p style="color:#888;">Sua Chave de Licenca</p></div>'
@@ -218,16 +233,8 @@ async def send_license_email(to_email, license_key, plan):
         html += f'<div style="background:#1a1a2e;border-radius:8px;padding:15px;"><p style="color:#ccc;"><strong>Plano:</strong> {plan_name}</p><p style="color:#ccc;"><strong>E-mail:</strong> {to_email}</p></div>'
         html += '<div style="margin-top:20px;padding:15px;background:#1a1a2e;border-radius:8px;"><h3 style="color:#d4af37;">Como usar:</h3><ol style="color:#ccc;"><li>Instale o Medical Safe Gold</li><li>Na tela de cadastro, insira seu e-mail e crie uma senha</li><li>Cole a chave de licenca acima</li><li>Pronto!</li></ol></div>'
         html += '<div style="text-align:center;margin-top:30px;color:#666;font-size:12px;"><p>Suporte: jonnathancoelhosilvacoelho@gmail.com | WhatsApp: +55 (11) 94849-6712</p></div></div>'
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"Medical Safe Gold - Sua Chave de Licenca: {license_key}"
-        msg["From"] = SMTP_FROM
-        msg["To"] = to_email
-        msg.attach(MIMEText(html, "html"))
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.sendmail(SMTP_FROM, to_email, msg.as_string())
-        return True
+        subject = f"Medical Safe Gold - Sua Chave de Licenca: {license_key}"
+        return await asyncio.to_thread(_send_email_sync, to_email, subject, html)
     except Exception as e:
         print(f"Email send error: {e}")
         return False
@@ -237,24 +244,13 @@ async def send_reset_email(to_email, reset_token):
     if not SMTP_USER or not SMTP_PASSWORD:
         return False
     try:
-        import smtplib
-        from email.mime.text import MIMEText
-        from email.mime.multipart import MIMEMultipart
         html = '<div style="font-family:Arial;max-width:600px;margin:0 auto;background:#0a0a0f;color:#fff;padding:30px;border-radius:12px;">'
         html += '<div style="text-align:center;margin-bottom:30px;"><h1 style="color:#d4af37;">Medical Safe Gold</h1><p style="color:#888;">Recuperacao de Senha</p></div>'
         html += f'<div style="background:#1a1a2e;border:1px solid #d4af37;border-radius:8px;padding:20px;text-align:center;margin:20px 0;"><p style="color:#888;">Seu codigo de recuperacao:</p><h2 style="color:#d4af37;font-family:monospace;letter-spacing:3px;font-size:28px;">{reset_token}</h2></div>'
         html += '<p style="color:#ccc;text-align:center;">Este codigo expira em 1 hora.</p>'
         html += '<p style="color:#ccc;text-align:center;">Se voce nao solicitou, ignore este e-mail.</p></div>'
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"Medical Safe Gold - Codigo de Recuperacao: {reset_token}"
-        msg["From"] = SMTP_FROM
-        msg["To"] = to_email
-        msg.attach(MIMEText(html, "html"))
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.sendmail(SMTP_FROM, to_email, msg.as_string())
-        return True
+        subject = f"Medical Safe Gold - Codigo de Recuperacao: {reset_token}"
+        return await asyncio.to_thread(_send_email_sync, to_email, subject, html)
     except Exception as e:
         print(f"Reset email send error: {e}")
         return False
