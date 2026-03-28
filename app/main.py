@@ -38,6 +38,7 @@ SMTP_USER = os.environ.get("SMTP_USER", "")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
 SMTP_FROM = os.environ.get("SMTP_FROM", "noreply@medicalsafegold.com")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "")
 
 # --- App ---
 app = FastAPI(title="Medical Safe Gold API", version="2.0.0")
@@ -206,6 +207,32 @@ def generate_license_key() -> str:
     return "-".join(parts)
 
 
+def _send_email_via_brevo(to_email, subject, html_body):
+    """Send email via Brevo (Sendinblue) HTTP API - 300 emails/day free."""
+    import json
+    import urllib.request
+    data = json.dumps({
+        "sender": {"name": "Medical Safe Gold", "email": SMTP_FROM},
+        "to": [{"email": to_email}],
+        "subject": subject,
+        "htmlContent": html_body,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.brevo.com/v3/smtp/email",
+        data=data,
+        headers={
+            "api-key": BREVO_API_KEY,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        result = json.loads(resp.read())
+        print(f"Brevo API response: {result}")
+    return True
+
+
 def _send_email_via_resend(to_email, subject, html_body):
     """Send email via Resend HTTP API - works on platforms that block SMTP."""
     import json
@@ -258,8 +285,10 @@ def _send_email_via_smtp(to_email, subject, html_body):
 
 
 def _send_email_sync(to_email, subject, html_body):
-    """Send email using best available method."""
-    if RESEND_API_KEY:
+    """Send email using best available method. Priority: Brevo > Resend > SMTP."""
+    if BREVO_API_KEY:
+        return _send_email_via_brevo(to_email, subject, html_body)
+    elif RESEND_API_KEY:
         return _send_email_via_resend(to_email, subject, html_body)
     elif SMTP_USER and SMTP_PASSWORD:
         return _send_email_via_smtp(to_email, subject, html_body)
@@ -268,7 +297,7 @@ def _send_email_sync(to_email, subject, html_body):
 
 
 async def send_license_email(to_email, license_key, plan):
-    if not RESEND_API_KEY and (not SMTP_USER or not SMTP_PASSWORD):
+    if not BREVO_API_KEY and not RESEND_API_KEY and (not SMTP_USER or not SMTP_PASSWORD):
         return False
     try:
         plan_name = "Mensal (R$ 69/mes)" if plan == "monthly" else "Anual (R$ 549/ano)"
@@ -286,8 +315,8 @@ async def send_license_email(to_email, license_key, plan):
 
 
 async def send_reset_email(to_email, reset_token):
-    if not RESEND_API_KEY and (not SMTP_USER or not SMTP_PASSWORD):
-        return False, "No email provider configured (set RESEND_API_KEY or SMTP_USER/SMTP_PASSWORD)"
+    if not BREVO_API_KEY and not RESEND_API_KEY and (not SMTP_USER or not SMTP_PASSWORD):
+        return False, "No email provider configured (set BREVO_API_KEY, RESEND_API_KEY, or SMTP_USER/SMTP_PASSWORD)"
     try:
         html = '<div style="font-family:Arial;max-width:600px;margin:0 auto;background:#0a0a0f;color:#fff;padding:30px;border-radius:12px;">'
         html += '<div style="text-align:center;margin-bottom:30px;"><h1 style="color:#d4af37;">Medical Safe Gold</h1><p style="color:#888;">Recuperacao de Senha</p></div>'
@@ -487,7 +516,7 @@ async def forgot_password(req: ForgotPasswordRequest):
     return {
         "success": True, "message": "If the email exists, a reset code has been sent.",
         "email_sent": email_sent,
-        "email_configured": bool(RESEND_API_KEY or (SMTP_USER and SMTP_PASSWORD)),
+        "email_configured": bool(BREVO_API_KEY or RESEND_API_KEY or (SMTP_USER and SMTP_PASSWORD)),
         "_debug_code": reset_code if not email_sent else None,
         "_debug_error": email_error,
     }
@@ -664,11 +693,11 @@ async def health():
         return {
             "status": "ok",
             "database": "connected",
-            "email_configured": bool(RESEND_API_KEY or (SMTP_USER and SMTP_PASSWORD)),
-            "email_provider": "resend" if RESEND_API_KEY else ("smtp" if SMTP_USER else "none"),
+            "email_configured": bool(BREVO_API_KEY or RESEND_API_KEY or (SMTP_USER and SMTP_PASSWORD)),
+            "email_provider": "brevo" if BREVO_API_KEY else ("resend" if RESEND_API_KEY else ("smtp" if SMTP_USER else "none")),
         }
     except Exception:
-        return {"status": "ok", "database": "disconnected", "email_configured": bool(RESEND_API_KEY or (SMTP_USER and SMTP_PASSWORD))}
+        return {"status": "ok", "database": "disconnected", "email_configured": bool(BREVO_API_KEY or RESEND_API_KEY or (SMTP_USER and SMTP_PASSWORD))}
 
 
 @app.get("/")
