@@ -208,6 +208,7 @@ def generate_license_key() -> str:
 def _send_email_sync(to_email, subject, html_body):
     """Synchronous email sending - runs in thread pool."""
     import smtplib
+    import ssl
     from email.mime.text import MIMEText
     from email.mime.multipart import MIMEMultipart
     msg = MIMEMultipart("alternative")
@@ -215,11 +216,20 @@ def _send_email_sync(to_email, subject, html_body):
     msg["From"] = SMTP_FROM
     msg["To"] = to_email
     msg.attach(MIMEText(html_body, "html"))
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASSWORD)
-        server.sendmail(SMTP_FROM, to_email, msg.as_string())
-    return True
+    # Try SSL (port 465) first, then STARTTLS (port 587)
+    try:
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL(SMTP_HOST, 465, timeout=30, context=context) as server:
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(SMTP_FROM, to_email, msg.as_string())
+        return True
+    except Exception as e_ssl:
+        print(f"SMTP_SSL (465) failed: {e_ssl}, trying STARTTLS (587)...")
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(SMTP_FROM, to_email, msg.as_string())
+        return True
 
 
 async def send_license_email(to_email, license_key, plan):
