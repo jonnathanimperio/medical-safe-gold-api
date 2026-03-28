@@ -242,7 +242,7 @@ async def send_license_email(to_email, license_key, plan):
 
 async def send_reset_email(to_email, reset_token):
     if not SMTP_USER or not SMTP_PASSWORD:
-        return False
+        return False, "SMTP credentials not configured"
     try:
         html = '<div style="font-family:Arial;max-width:600px;margin:0 auto;background:#0a0a0f;color:#fff;padding:30px;border-radius:12px;">'
         html += '<div style="text-align:center;margin-bottom:30px;"><h1 style="color:#d4af37;">Medical Safe Gold</h1><p style="color:#888;">Recuperacao de Senha</p></div>'
@@ -250,10 +250,12 @@ async def send_reset_email(to_email, reset_token):
         html += '<p style="color:#ccc;text-align:center;">Este codigo expira em 1 hora.</p>'
         html += '<p style="color:#ccc;text-align:center;">Se voce nao solicitou, ignore este e-mail.</p></div>'
         subject = f"Medical Safe Gold - Codigo de Recuperacao: {reset_token}"
-        return await asyncio.to_thread(_send_email_sync, to_email, subject, html)
+        await asyncio.to_thread(_send_email_sync, to_email, subject, html)
+        return True, None
     except Exception as e:
-        print(f"Reset email send error: {e}")
-        return False
+        error_msg = str(e)
+        print(f"Reset email send error: {error_msg}")
+        return False, error_msg
 
 
 # --- Auth Endpoints ---
@@ -436,12 +438,13 @@ async def forgot_password(req: ForgotPasswordRequest):
         "expires_at": datetime.now(timezone.utc) + timedelta(hours=1),
         "created_at": datetime.now(timezone.utc),
     })
-    email_sent = await send_reset_email(email, reset_code)
+    email_sent, email_error = await send_reset_email(email, reset_code)
     return {
         "success": True, "message": "If the email exists, a reset code has been sent.",
         "email_sent": email_sent,
         "smtp_configured": bool(SMTP_USER and SMTP_PASSWORD),
-        "_debug_code": reset_code if not SMTP_USER else None,
+        "_debug_code": reset_code if not email_sent else None,
+        "_debug_error": email_error,
     }
 
 
