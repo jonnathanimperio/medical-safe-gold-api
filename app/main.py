@@ -516,9 +516,6 @@ async def forgot_password(req: ForgotPasswordRequest):
     return {
         "success": True, "message": "If the email exists, a reset code has been sent.",
         "email_sent": email_sent,
-        "email_configured": bool(BREVO_API_KEY or RESEND_API_KEY or (SMTP_USER and SMTP_PASSWORD)),
-        "_debug_code": reset_code if not email_sent else None,
-        "_debug_error": email_error,
     }
 
 
