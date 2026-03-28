@@ -444,6 +444,7 @@ async def forgot_password(req: ForgotPasswordRequest):
     return {
         "success": True, "message": "If the email exists, a reset code has been sent.",
         "email_sent": email_sent,
+        "smtp_configured": bool(SMTP_USER and SMTP_PASSWORD),
         "_debug_code": reset_code if not SMTP_USER else None,
     }
 
@@ -616,9 +617,13 @@ async def admin_revoke_license(license_key: str, admin: bool = Depends(verify_ad
 async def health():
     try:
         await client.admin.command("ping")
-        return {"status": "ok", "database": "connected"}
+        return {
+            "status": "ok",
+            "database": "connected",
+            "smtp_configured": bool(SMTP_USER and SMTP_PASSWORD),
+        }
     except Exception:
-        return {"status": "ok", "database": "disconnected"}
+        return {"status": "ok", "database": "disconnected", "smtp_configured": bool(SMTP_USER and SMTP_PASSWORD)}
 
 
 @app.get("/")
