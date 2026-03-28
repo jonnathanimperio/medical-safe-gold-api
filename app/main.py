@@ -37,6 +37,7 @@ SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ.get("SMTP_USER", "")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
 SMTP_FROM = os.environ.get("SMTP_FROM", "noreply@medicalsafegold.com")
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 
 # --- App ---
 app = FastAPI(title="Medical Safe Gold API", version="2.0.0")
@@ -205,8 +206,33 @@ def generate_license_key() -> str:
     return "-".join(parts)
 
 
-def _send_email_sync(to_email, subject, html_body):
-    """Synchronous email sending - runs in thread pool."""
+def _send_email_via_resend(to_email, subject, html_body):
+    """Send email via Resend HTTP API - works on platforms that block SMTP."""
+    import json
+    import urllib.request
+    data = json.dumps({
+        "from": SMTP_FROM,
+        "to": [to_email],
+        "subject": subject,
+        "html": html_body,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=data,
+        headers={
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        result = json.loads(resp.read())
+        print(f"Resend API response: {result}")
+    return True
+
+
+def _send_email_via_smtp(to_email, subject, html_body):
+    """Send email via SMTP - works when SMTP ports are not blocked."""
     import smtplib
     import ssl
     from email.mime.text import MIMEText
@@ -216,7 +242,6 @@ def _send_email_sync(to_email, subject, html_body):
     msg["From"] = SMTP_FROM
     msg["To"] = to_email
     msg.attach(MIMEText(html_body, "html"))
-    # Try SSL (port 465) first, then STARTTLS (port 587)
     try:
         context = ssl.create_default_context()
         with smtplib.SMTP_SSL(SMTP_HOST, 465, timeout=30, context=context) as server:
@@ -232,8 +257,18 @@ def _send_email_sync(to_email, subject, html_body):
         return True
 
 
+def _send_email_sync(to_email, subject, html_body):
+    """Send email using best available method."""
+    if RESEND_API_KEY:
+        return _send_email_via_resend(to_email, subject, html_body)
+    elif SMTP_USER and SMTP_PASSWORD:
+        return _send_email_via_smtp(to_email, subject, html_body)
+    else:
+        raise RuntimeError("No email provider configured")
+
+
 async def send_license_email(to_email, license_key, plan):
-    if not SMTP_USER or not SMTP_PASSWORD:
+    if not RESEND_API_KEY and (not SMTP_USER or not SMTP_PASSWORD):
         return False
     try:
         plan_name = "Mensal (R$ 69/mes)" if plan == "monthly" else "Anual (R$ 549/ano)"
@@ -251,8 +286,8 @@ async def send_license_email(to_email, license_key, plan):
 
 
 async def send_reset_email(to_email, reset_token):
-    if not SMTP_USER or not SMTP_PASSWORD:
-        return False, "SMTP credentials not configured"
+    if not RESEND_API_KEY and (not SMTP_USER or not SMTP_PASSWORD):
+        return False, "No email provider configured (set RESEND_API_KEY or SMTP_USER/SMTP_PASSWORD)"
     try:
         html = '<div style="font-family:Arial;max-width:600px;margin:0 auto;background:#0a0a0f;color:#fff;padding:30px;border-radius:12px;">'
         html += '<div style="text-align:center;margin-bottom:30px;"><h1 style="color:#d4af37;">Medical Safe Gold</h1><p style="color:#888;">Recuperacao de Senha</p></div>'
@@ -452,7 +487,7 @@ async def forgot_password(req: ForgotPasswordRequest):
     return {
         "success": True, "message": "If the email exists, a reset code has been sent.",
         "email_sent": email_sent,
-        "smtp_configured": bool(SMTP_USER and SMTP_PASSWORD),
+        "email_configured": bool(RESEND_API_KEY or (SMTP_USER and SMTP_PASSWORD)),
         "_debug_code": reset_code if not email_sent else None,
         "_debug_error": email_error,
     }
@@ -629,10 +664,11 @@ async def health():
         return {
             "status": "ok",
             "database": "connected",
-            "smtp_configured": bool(SMTP_USER and SMTP_PASSWORD),
+            "email_configured": bool(RESEND_API_KEY or (SMTP_USER and SMTP_PASSWORD)),
+            "email_provider": "resend" if RESEND_API_KEY else ("smtp" if SMTP_USER else "none"),
         }
     except Exception:
-        return {"status": "ok", "database": "disconnected", "smtp_configured": bool(SMTP_USER and SMTP_PASSWORD)}
+        return {"status": "ok", "database": "disconnected", "email_configured": bool(RESEND_API_KEY or (SMTP_USER and SMTP_PASSWORD))}
 
 
 @app.get("/")
