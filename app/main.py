@@ -430,7 +430,7 @@ async def register(req: RegisterRequest):
     # Validate role
     role = req.role.strip().lower() if req.role else "doctor"
     if role not in ("doctor", "receptionist"):
-        role = "doctor"
+        role = "receptionist"
 
     await db.users.insert_one({
         "email": email,
@@ -812,7 +812,7 @@ async def get_anexo(
     return Response(
         content=file_data,
         media_type=doc.get("content_type", "application/octet-stream"),
-        headers={"Content-Disposition": f'attachment; filename="{doc.get("filename", "arquivo")}"'},
+        headers={"Content-Disposition": f'attachment; filename="{doc.get("filename", "arquivo").replace(chr(34), "_").replace(chr(92), "_").replace(chr(10), "").replace(chr(13), "")}"'},
     )
 
 
@@ -957,10 +957,19 @@ async def upload_anexo(
     if not prontuario:
         raise HTTPException(status_code=404, detail="Prontuario not found")
 
-    # Read file (max 10MB)
-    content = await file.read()
-    if len(content) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="File too large (max 10MB)")
+    # Read file in chunks (max 10MB) to prevent memory exhaustion
+    MAX_UPLOAD_SIZE = 10 * 1024 * 1024
+    chunks = []
+    total = 0
+    while True:
+        chunk = await file.read(8192)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAX_UPLOAD_SIZE:
+            raise HTTPException(status_code=400, detail="File too large (max 10MB)")
+        chunks.append(chunk)
+    content = b"".join(chunks)
 
     # Store file as base64 in anexos collection
     anexo_doc = {
