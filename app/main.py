@@ -10,9 +10,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 
 import bcrypt
+from bson import ObjectId
 from cryptography.fernet import Fernet
 from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from jose import jwt, JWTError
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel
@@ -793,131 +795,6 @@ async def create_prontuario(
     return {"success": True, "id": str(result.inserted_id)}
 
 
-@app.get("/prontuarios/{patient_id}")
-async def get_prontuarios(
-    patient_id: str,
-    request: Request,
-    email: str = Depends(verify_doctor),
-):
-    """Get all prontuarios for a patient. Doctor only."""
-    docs = await db.prontuarios.find({"patient_id": patient_id}).sort("created_at", -1).to_list(length=1000)
-    results = []
-    for doc in docs:
-        anexo_count = len(doc.get("anexos", []))
-        results.append({
-            "id": str(doc["_id"]),
-            "patient_id": doc["patient_id"],
-            "appointment_id": doc.get("appointment_id", ""),
-            "doctor_id": doc["doctor_id"],
-            "sintomas": doc["sintomas"],
-            "diagnostico": doc["diagnostico"],
-            "tratamento": doc["tratamento"],
-            "observacoes": doc.get("observacoes", ""),
-            "patient_name": doc.get("patient_name", ""),
-            "patient_cpf": doc.get("patient_cpf", ""),
-            "anexo_count": anexo_count,
-            "created_at": doc["created_at"].isoformat() if doc.get("created_at") else None,
-            "updated_at": doc["updated_at"].isoformat() if doc.get("updated_at") else None,
-        })
-    await log_access(email, "VIEW_PRONTUARIOS", "", f"patient={patient_id}, count={len(results)}", request)
-    return {"success": True, "data": results}
-
-
-@app.put("/prontuarios/{prontuario_id}")
-async def update_prontuario(
-    prontuario_id: str,
-    data: ProntuarioUpdate,
-    request: Request,
-    email: str = Depends(verify_doctor),
-):
-    """Update a prontuario. Doctor only."""
-    from bson import ObjectId
-
-    update_fields = {"updated_at": datetime.now(timezone.utc)}
-    if data.sintomas is not None:
-        update_fields["sintomas"] = data.sintomas
-    if data.diagnostico is not None:
-        update_fields["diagnostico"] = data.diagnostico
-    if data.tratamento is not None:
-        update_fields["tratamento"] = data.tratamento
-    if data.observacoes is not None:
-        update_fields["observacoes"] = data.observacoes
-
-    result = await db.prontuarios.update_one(
-        {"_id": ObjectId(prontuario_id)},
-        {"$set": update_fields},
-    )
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Prontuario not found")
-    await log_access(email, "UPDATE_PRONTUARIO", prontuario_id, "", request)
-    return {"success": True}
-
-
-@app.delete("/prontuarios/{prontuario_id}")
-async def delete_prontuario(
-    prontuario_id: str,
-    request: Request,
-    email: str = Depends(verify_doctor),
-):
-    """Delete a prontuario. Doctor only."""
-    from bson import ObjectId
-
-    result = await db.prontuarios.delete_one({"_id": ObjectId(prontuario_id)})
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Prontuario not found")
-    # Also delete associated anexos
-    await db.anexos.delete_many({"prontuario_id": prontuario_id})
-    await log_access(email, "DELETE_PRONTUARIO", prontuario_id, "", request)
-    return {"success": True}
-
-
-@app.post("/prontuarios/{prontuario_id}/upload")
-async def upload_anexo(
-    prontuario_id: str,
-    request: Request,
-    file: UploadFile = File(...),
-    descricao: str = Form(""),
-    email: str = Depends(verify_doctor),
-):
-    """Upload an exam/file attachment to a prontuario. Doctor only. Max 10MB."""
-    from bson import ObjectId
-
-    # Verify prontuario exists
-    prontuario = await db.prontuarios.find_one({"_id": ObjectId(prontuario_id)})
-    if not prontuario:
-        raise HTTPException(status_code=404, detail="Prontuario not found")
-
-    # Read file (max 10MB)
-    content = await file.read()
-    if len(content) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="File too large (max 10MB)")
-
-    # Store file as base64 in anexos collection
-    anexo_doc = {
-        "prontuario_id": prontuario_id,
-        "filename": file.filename or "arquivo",
-        "content_type": file.content_type or "application/octet-stream",
-        "size": len(content),
-        "data": base64.b64encode(content).decode(),
-        "descricao": descricao,
-        "uploaded_by": email,
-        "uploaded_at": datetime.now(timezone.utc),
-    }
-    result = await db.anexos.insert_one(anexo_doc)
-    anexo_id = str(result.inserted_id)
-
-    # Add reference to prontuario
-    await db.prontuarios.update_one(
-        {"_id": ObjectId(prontuario_id)},
-        {
-            "$push": {"anexos": {"id": anexo_id, "filename": file.filename, "descricao": descricao}},
-            "$set": {"updated_at": datetime.now(timezone.utc)},
-        },
-    )
-    await log_access(email, "UPLOAD_ANEXO", prontuario_id, f"file={file.filename}, size={len(content)}", request)
-    return {"success": True, "anexo_id": anexo_id, "filename": file.filename}
-
-
 @app.get("/prontuarios/anexo/{anexo_id}")
 async def get_anexo(
     anexo_id: str,
@@ -925,9 +802,6 @@ async def get_anexo(
     email: str = Depends(verify_doctor),
 ):
     """Get an attached file by ID. Doctor only."""
-    from bson import ObjectId
-    from fastapi.responses import Response
-
     doc = await db.anexos.find_one({"_id": ObjectId(anexo_id)})
     if not doc:
         raise HTTPException(status_code=404, detail="Anexo not found")
@@ -975,8 +849,6 @@ async def delete_anexo(
     email: str = Depends(verify_doctor),
 ):
     """Delete an attached file. Doctor only."""
-    from bson import ObjectId
-
     doc = await db.anexos.find_one({"_id": ObjectId(anexo_id)})
     if not doc:
         raise HTTPException(status_code=404, detail="Anexo not found")
@@ -995,6 +867,125 @@ async def delete_anexo(
         )
     await log_access(email, "DELETE_ANEXO", prontuario_id, f"file={doc.get('filename')}", request)
     return {"success": True}
+
+
+@app.get("/prontuarios/{patient_id}")
+async def get_prontuarios(
+    patient_id: str,
+    request: Request,
+    email: str = Depends(verify_doctor),
+):
+    """Get all prontuarios for a patient. Doctor only."""
+    docs = await db.prontuarios.find({"patient_id": patient_id}).sort("created_at", -1).to_list(length=1000)
+    results = []
+    for doc in docs:
+        anexo_count = len(doc.get("anexos", []))
+        results.append({
+            "id": str(doc["_id"]),
+            "patient_id": doc["patient_id"],
+            "appointment_id": doc.get("appointment_id", ""),
+            "doctor_id": doc["doctor_id"],
+            "sintomas": doc["sintomas"],
+            "diagnostico": doc["diagnostico"],
+            "tratamento": doc["tratamento"],
+            "observacoes": doc.get("observacoes", ""),
+            "patient_name": doc.get("patient_name", ""),
+            "patient_cpf": doc.get("patient_cpf", ""),
+            "anexo_count": anexo_count,
+            "created_at": doc["created_at"].isoformat() if doc.get("created_at") else None,
+            "updated_at": doc["updated_at"].isoformat() if doc.get("updated_at") else None,
+        })
+    await log_access(email, "VIEW_PRONTUARIOS", "", f"patient={patient_id}, count={len(results)}", request)
+    return {"success": True, "data": results}
+
+
+@app.put("/prontuarios/{prontuario_id}")
+async def update_prontuario(
+    prontuario_id: str,
+    data: ProntuarioUpdate,
+    request: Request,
+    email: str = Depends(verify_doctor),
+):
+    """Update a prontuario. Doctor only."""
+    update_fields = {"updated_at": datetime.now(timezone.utc)}
+    if data.sintomas is not None:
+        update_fields["sintomas"] = data.sintomas
+    if data.diagnostico is not None:
+        update_fields["diagnostico"] = data.diagnostico
+    if data.tratamento is not None:
+        update_fields["tratamento"] = data.tratamento
+    if data.observacoes is not None:
+        update_fields["observacoes"] = data.observacoes
+
+    result = await db.prontuarios.update_one(
+        {"_id": ObjectId(prontuario_id)},
+        {"$set": update_fields},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Prontuario not found")
+    await log_access(email, "UPDATE_PRONTUARIO", prontuario_id, "", request)
+    return {"success": True}
+
+
+@app.delete("/prontuarios/{prontuario_id}")
+async def delete_prontuario(
+    prontuario_id: str,
+    request: Request,
+    email: str = Depends(verify_doctor),
+):
+    """Delete a prontuario. Doctor only."""
+    result = await db.prontuarios.delete_one({"_id": ObjectId(prontuario_id)})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Prontuario not found")
+    # Also delete associated anexos
+    await db.anexos.delete_many({"prontuario_id": prontuario_id})
+    await log_access(email, "DELETE_PRONTUARIO", prontuario_id, "", request)
+    return {"success": True}
+
+
+@app.post("/prontuarios/{prontuario_id}/upload")
+async def upload_anexo(
+    prontuario_id: str,
+    request: Request,
+    file: UploadFile = File(...),
+    descricao: str = Form(""),
+    email: str = Depends(verify_doctor),
+):
+    """Upload an exam/file attachment to a prontuario. Doctor only. Max 10MB."""
+    # Verify prontuario exists
+    prontuario = await db.prontuarios.find_one({"_id": ObjectId(prontuario_id)})
+    if not prontuario:
+        raise HTTPException(status_code=404, detail="Prontuario not found")
+
+    # Read file (max 10MB)
+    content = await file.read()
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File too large (max 10MB)")
+
+    # Store file as base64 in anexos collection
+    anexo_doc = {
+        "prontuario_id": prontuario_id,
+        "filename": file.filename or "arquivo",
+        "content_type": file.content_type or "application/octet-stream",
+        "size": len(content),
+        "data": base64.b64encode(content).decode(),
+        "descricao": descricao,
+        "uploaded_by": email,
+        "uploaded_at": datetime.now(timezone.utc),
+    }
+    result = await db.anexos.insert_one(anexo_doc)
+    anexo_id = str(result.inserted_id)
+
+    # Add reference to prontuario
+    await db.prontuarios.update_one(
+        {"_id": ObjectId(prontuario_id)},
+        {
+            "$push": {"anexos": {"id": anexo_id, "filename": file.filename, "descricao": descricao}},
+            "$set": {"updated_at": datetime.now(timezone.utc)},
+        },
+    )
+    await log_access(email, "UPLOAD_ANEXO", prontuario_id, f"file={file.filename}, size={len(content)}", request)
+    return {"success": True, "anexo_id": anexo_id, "filename": file.filename}
 
 
 # --- Access Logs (Admin) ---
