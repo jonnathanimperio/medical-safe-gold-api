@@ -94,7 +94,7 @@ class RegisterRequest(BaseModel):
     password: str
     machine_id: str
     license_key: str
-    role: str = "doctor"  # "doctor" or "receptionist"
+    role: str = "receptionist"  # "doctor" or "receptionist"
 
 
 class LoginRequest(BaseModel):
