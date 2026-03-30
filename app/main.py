@@ -3,15 +3,18 @@
 import os
 import csv
 import io
+import base64
 import asyncio
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, List
 
 import bcrypt
+from bson import ObjectId
 from cryptography.fernet import Fernet
-from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from jose import jwt, JWTError
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel
@@ -67,6 +70,15 @@ async def startup_db():
     await db.licenses.create_index("email")
     await db.password_resets.create_index("token", unique=True)
     await db.password_resets.create_index("expires_at", expireAfterSeconds=0)
+    # Prontuario indexes
+    await db.prontuarios.create_index("patient_id")
+    await db.prontuarios.create_index("doctor_id")
+    await db.prontuarios.create_index("created_at")
+    # Access logs indexes
+    await db.access_logs.create_index("user_email")
+    await db.access_logs.create_index("timestamp")
+    # Anexos (exam files) indexes
+    await db.anexos.create_index("prontuario_id")
 
 
 @app.on_event("shutdown")
@@ -82,6 +94,7 @@ class RegisterRequest(BaseModel):
     password: str
     machine_id: str
     license_key: str
+    role: str = "receptionist"  # "doctor" or "receptionist"
 
 
 class LoginRequest(BaseModel):
@@ -114,6 +127,7 @@ class AuthResponse(BaseModel):
     subscription_status: Optional[str] = None
     subscription_plan: Optional[str] = None
     subscription_expires: Optional[str] = None
+    role: Optional[str] = None
     error: Optional[str] = None
 
 
@@ -130,6 +144,26 @@ class ForgotPasswordRequest(BaseModel):
 class ResetPasswordRequest(BaseModel):
     token: str
     new_password: str
+
+
+class ProntuarioCreate(BaseModel):
+    patient_id: str
+    appointment_id: Optional[str] = None
+    sintomas: str
+    diagnostico: str
+    tratamento: str
+    observacoes: Optional[str] = ""
+    patient_name: Optional[str] = ""
+    patient_cpf: Optional[str] = ""
+    encrypted: Optional[bool] = False
+
+
+class ProntuarioUpdate(BaseModel):
+    sintomas: Optional[str] = None
+    diagnostico: Optional[str] = None
+    tratamento: Optional[str] = None
+    observacoes: Optional[str] = None
+    encrypted: Optional[bool] = None
 
 
 # --- Helpers ---
@@ -179,6 +213,31 @@ async def verify_admin(x_admin_key: str = Header(...)) -> bool:
     if x_admin_key != ADMIN_KEY:
         raise HTTPException(status_code=403, detail="Invalid admin key")
     return True
+
+
+async def verify_doctor(email: str = Depends(verify_token)) -> str:
+    """Verify user is authenticated AND has doctor role."""
+    user = await db.users.find_one({"email": email})
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    if user.get("role", "doctor") != "doctor":
+        raise HTTPException(status_code=403, detail="ACCESS_DENIED_DOCTOR_ONLY")
+    return email
+
+
+async def log_access(user_email: str, action: str, prontuario_id: str = "", details: str = "", request: Optional[Request] = None):
+    """Log access to prontuario data for LGPD compliance."""
+    client_ip = ""
+    if request:
+        client_ip = request.client.host if request.client else ""
+    await db.access_logs.insert_one({
+        "user_email": user_email,
+        "action": action,
+        "prontuario_id": prontuario_id,
+        "details": details,
+        "ip": client_ip,
+        "timestamp": datetime.now(timezone.utc),
+    })
 
 
 def check_subscription(user: dict) -> tuple[bool, str]:
@@ -370,12 +429,18 @@ async def register(req: RegisterRequest):
     else:
         expires = datetime.now(timezone.utc) + timedelta(days=TRIAL_DAYS)
 
+    # Validate role
+    role = req.role.strip().lower() if req.role else "doctor"
+    if role not in ("doctor", "receptionist"):
+        return AuthResponse(success=False, error="INVALID_ROLE")
+
     await db.users.insert_one({
         "email": email,
         "password_hash": password_hash.decode() if isinstance(password_hash, bytes) else password_hash,
         "machine_id": req.machine_id,
         "fernet_key_encrypted": encrypted_fernet_key,
         "license_key": license_key,
+        "role": role,
         "subscription_status": "active",
         "subscription_plan": plan,
         "subscription_expires": expires,
@@ -396,6 +461,7 @@ async def register(req: RegisterRequest):
     return AuthResponse(
         success=True, token=token, fernet_key=user_fernet_key, clinica_id=email,
         subscription_status="active", subscription_plan=plan, subscription_expires=expires.isoformat(),
+        role=role,
     )
 
 
@@ -455,6 +521,7 @@ async def login(req: LoginRequest):
         subscription_expires=user.get("subscription_expires", "").isoformat()
         if user.get("subscription_expires")
         else None,
+        role=user.get("role", "doctor"),
     )
 
 
@@ -699,4 +766,264 @@ async def health():
 
 @app.get("/")
 async def root():
-    return {"app": "Medical Safe Gold API", "version": "2.0.0", "status": "running"}
+    return {"app": "Medical Safe Gold API", "version": "3.0.0", "status": "running"}
+
+
+# --- Prontuario Endpoints (Doctor Only) ---
+
+@app.post("/prontuarios")
+async def create_prontuario(
+    data: ProntuarioCreate,
+    request: Request,
+    email: str = Depends(verify_doctor),
+):
+    """Create a new prontuario (medical record). Doctor only."""
+    doc = {
+        "patient_id": data.patient_id,
+        "appointment_id": data.appointment_id or "",
+        "doctor_id": email,
+        "sintomas": data.sintomas,
+        "diagnostico": data.diagnostico,
+        "tratamento": data.tratamento,
+        "observacoes": data.observacoes or "",
+        "patient_name": data.patient_name or "",
+        "patient_cpf": data.patient_cpf or "",
+        "encrypted": data.encrypted or False,
+        "anexos": [],
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+    }
+    result = await db.prontuarios.insert_one(doc)
+    await log_access(email, "CREATE_PRONTUARIO", str(result.inserted_id), f"patient={data.patient_id}", request)
+    return {"success": True, "id": str(result.inserted_id)}
+
+
+@app.get("/prontuarios/anexo/{anexo_id}")
+async def get_anexo(
+    anexo_id: str,
+    request: Request,
+    email: str = Depends(verify_doctor),
+):
+    """Get an attached file by ID. Doctor only."""
+    doc = await db.anexos.find_one({"_id": ObjectId(anexo_id)})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Anexo not found")
+
+    await log_access(email, "VIEW_ANEXO", doc.get("prontuario_id", ""), f"file={doc.get('filename')}", request)
+
+    file_data = base64.b64decode(doc["data"])
+    return Response(
+        content=file_data,
+        media_type=doc.get("content_type", "application/octet-stream"),
+        headers={"Content-Disposition": f'attachment; filename="{doc.get("filename", "arquivo").replace(chr(34), "_").replace(chr(92), "_").replace(chr(10), "").replace(chr(13), "")}"'},
+    )
+
+
+@app.get("/prontuarios/anexos/{prontuario_id}")
+async def list_anexos(
+    prontuario_id: str,
+    request: Request,
+    email: str = Depends(verify_doctor),
+):
+    """List all anexos for a prontuario (metadata only, no file data). Doctor only."""
+    docs = await db.anexos.find(
+        {"prontuario_id": prontuario_id},
+        {"data": 0},  # Exclude file data for performance
+    ).to_list(length=100)
+    results = []
+    for doc in docs:
+        results.append({
+            "id": str(doc["_id"]),
+            "filename": doc.get("filename", ""),
+            "content_type": doc.get("content_type", ""),
+            "size": doc.get("size", 0),
+            "descricao": doc.get("descricao", ""),
+            "uploaded_by": doc.get("uploaded_by", ""),
+            "uploaded_at": doc["uploaded_at"].isoformat() if doc.get("uploaded_at") else None,
+        })
+    await log_access(email, "LIST_ANEXOS", prontuario_id, f"count={len(results)}", request)
+    return {"success": True, "data": results}
+
+
+@app.delete("/prontuarios/anexo/{anexo_id}")
+async def delete_anexo(
+    anexo_id: str,
+    request: Request,
+    email: str = Depends(verify_doctor),
+):
+    """Delete an attached file. Doctor only."""
+    doc = await db.anexos.find_one({"_id": ObjectId(anexo_id)})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Anexo not found")
+
+    prontuario_id = doc.get("prontuario_id", "")
+    await db.anexos.delete_one({"_id": ObjectId(anexo_id)})
+
+    # Remove reference from prontuario
+    if prontuario_id:
+        await db.prontuarios.update_one(
+            {"_id": ObjectId(prontuario_id)},
+            {
+                "$pull": {"anexos": {"id": anexo_id}},
+                "$set": {"updated_at": datetime.now(timezone.utc)},
+            },
+        )
+    await log_access(email, "DELETE_ANEXO", prontuario_id, f"file={doc.get('filename')}", request)
+    return {"success": True}
+
+
+@app.get("/prontuarios/{patient_id}")
+async def get_prontuarios(
+    patient_id: str,
+    request: Request,
+    email: str = Depends(verify_doctor),
+):
+    """Get all prontuarios for a patient. Doctor only."""
+    docs = await db.prontuarios.find({"patient_id": patient_id}).sort("created_at", -1).to_list(length=1000)
+    results = []
+    for doc in docs:
+        anexo_count = len(doc.get("anexos", []))
+        results.append({
+            "id": str(doc["_id"]),
+            "patient_id": doc["patient_id"],
+            "appointment_id": doc.get("appointment_id", ""),
+            "doctor_id": doc["doctor_id"],
+            "sintomas": doc["sintomas"],
+            "diagnostico": doc["diagnostico"],
+            "tratamento": doc["tratamento"],
+            "observacoes": doc.get("observacoes", ""),
+            "patient_name": doc.get("patient_name", ""),
+            "patient_cpf": doc.get("patient_cpf", ""),
+            "encrypted": doc.get("encrypted", False),
+            "anexo_count": anexo_count,
+            "created_at": doc["created_at"].isoformat() if doc.get("created_at") else None,
+            "updated_at": doc["updated_at"].isoformat() if doc.get("updated_at") else None,
+        })
+    await log_access(email, "VIEW_PRONTUARIOS", "", f"patient={patient_id}, count={len(results)}", request)
+    return {"success": True, "data": results}
+
+
+@app.put("/prontuarios/{prontuario_id}")
+async def update_prontuario(
+    prontuario_id: str,
+    data: ProntuarioUpdate,
+    request: Request,
+    email: str = Depends(verify_doctor),
+):
+    """Update a prontuario. Doctor only."""
+    update_fields = {"updated_at": datetime.now(timezone.utc)}
+    if data.sintomas is not None:
+        update_fields["sintomas"] = data.sintomas
+    if data.diagnostico is not None:
+        update_fields["diagnostico"] = data.diagnostico
+    if data.tratamento is not None:
+        update_fields["tratamento"] = data.tratamento
+    if data.observacoes is not None:
+        update_fields["observacoes"] = data.observacoes
+    if data.encrypted is not None:
+        update_fields["encrypted"] = data.encrypted
+
+    result = await db.prontuarios.update_one(
+        {"_id": ObjectId(prontuario_id)},
+        {"$set": update_fields},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Prontuario not found")
+    await log_access(email, "UPDATE_PRONTUARIO", prontuario_id, "", request)
+    return {"success": True}
+
+
+@app.delete("/prontuarios/{prontuario_id}")
+async def delete_prontuario(
+    prontuario_id: str,
+    request: Request,
+    email: str = Depends(verify_doctor),
+):
+    """Delete a prontuario. Doctor only."""
+    result = await db.prontuarios.delete_one({"_id": ObjectId(prontuario_id)})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Prontuario not found")
+    # Also delete associated anexos
+    await db.anexos.delete_many({"prontuario_id": prontuario_id})
+    await log_access(email, "DELETE_PRONTUARIO", prontuario_id, "", request)
+    return {"success": True}
+
+
+@app.post("/prontuarios/{prontuario_id}/upload")
+async def upload_anexo(
+    prontuario_id: str,
+    request: Request,
+    file: UploadFile = File(...),
+    descricao: str = Form(""),
+    email: str = Depends(verify_doctor),
+):
+    """Upload an exam/file attachment to a prontuario. Doctor only. Max 10MB."""
+    # Verify prontuario exists
+    prontuario = await db.prontuarios.find_one({"_id": ObjectId(prontuario_id)})
+    if not prontuario:
+        raise HTTPException(status_code=404, detail="Prontuario not found")
+
+    # Read file in chunks (max 10MB) to prevent memory exhaustion
+    MAX_UPLOAD_SIZE = 10 * 1024 * 1024
+    chunks = []
+    total = 0
+    while True:
+        chunk = await file.read(8192)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAX_UPLOAD_SIZE:
+            raise HTTPException(status_code=400, detail="File too large (max 10MB)")
+        chunks.append(chunk)
+    content = b"".join(chunks)
+
+    # Store file as base64 in anexos collection
+    anexo_doc = {
+        "prontuario_id": prontuario_id,
+        "filename": file.filename or "arquivo",
+        "content_type": file.content_type or "application/octet-stream",
+        "size": len(content),
+        "data": base64.b64encode(content).decode(),
+        "descricao": descricao,
+        "uploaded_by": email,
+        "uploaded_at": datetime.now(timezone.utc),
+    }
+    result = await db.anexos.insert_one(anexo_doc)
+    anexo_id = str(result.inserted_id)
+
+    # Add reference to prontuario
+    await db.prontuarios.update_one(
+        {"_id": ObjectId(prontuario_id)},
+        {
+            "$push": {"anexos": {"id": anexo_id, "filename": file.filename, "descricao": descricao}},
+            "$set": {"updated_at": datetime.now(timezone.utc)},
+        },
+    )
+    await log_access(email, "UPLOAD_ANEXO", prontuario_id, f"file={file.filename}, size={len(content)}", request)
+    return {"success": True, "anexo_id": anexo_id, "filename": file.filename}
+
+
+# --- Access Logs (Admin) ---
+
+@app.get("/admin/access-logs")
+async def admin_access_logs(
+    limit: int = 100,
+    user_email: Optional[str] = None,
+    admin: bool = Depends(verify_admin),
+):
+    """View access logs for LGPD compliance. Admin only."""
+    query = {}
+    if user_email:
+        query["user_email"] = user_email.strip().lower()
+    docs = await db.access_logs.find(query).sort("timestamp", -1).to_list(length=limit)
+    results = []
+    for doc in docs:
+        results.append({
+            "user_email": doc.get("user_email", ""),
+            "action": doc.get("action", ""),
+            "prontuario_id": doc.get("prontuario_id", ""),
+            "details": doc.get("details", ""),
+            "ip": doc.get("ip", ""),
+            "timestamp": doc["timestamp"].isoformat() if doc.get("timestamp") else None,
+        })
+    return {"success": True, "total": len(results), "logs": results}
