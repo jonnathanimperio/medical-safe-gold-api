@@ -155,6 +155,7 @@ class ProntuarioCreate(BaseModel):
     observacoes: Optional[str] = ""
     patient_name: Optional[str] = ""
     patient_cpf: Optional[str] = ""
+    encrypted: Optional[bool] = False
 
 
 class ProntuarioUpdate(BaseModel):
@@ -162,6 +163,7 @@ class ProntuarioUpdate(BaseModel):
     diagnostico: Optional[str] = None
     tratamento: Optional[str] = None
     observacoes: Optional[str] = None
+    encrypted: Optional[bool] = None
 
 
 # --- Helpers ---
@@ -430,7 +432,7 @@ async def register(req: RegisterRequest):
     # Validate role
     role = req.role.strip().lower() if req.role else "doctor"
     if role not in ("doctor", "receptionist"):
-        role = "receptionist"
+        return AuthResponse(success=False, error="INVALID_ROLE")
 
     await db.users.insert_one({
         "email": email,
@@ -786,6 +788,7 @@ async def create_prontuario(
         "observacoes": data.observacoes or "",
         "patient_name": data.patient_name or "",
         "patient_cpf": data.patient_cpf or "",
+        "encrypted": data.encrypted or False,
         "anexos": [],
         "created_at": datetime.now(timezone.utc),
         "updated_at": datetime.now(timezone.utc),
@@ -891,6 +894,7 @@ async def get_prontuarios(
             "observacoes": doc.get("observacoes", ""),
             "patient_name": doc.get("patient_name", ""),
             "patient_cpf": doc.get("patient_cpf", ""),
+            "encrypted": doc.get("encrypted", False),
             "anexo_count": anexo_count,
             "created_at": doc["created_at"].isoformat() if doc.get("created_at") else None,
             "updated_at": doc["updated_at"].isoformat() if doc.get("updated_at") else None,
@@ -916,6 +920,8 @@ async def update_prontuario(
         update_fields["tratamento"] = data.tratamento
     if data.observacoes is not None:
         update_fields["observacoes"] = data.observacoes
+    if data.encrypted is not None:
+        update_fields["encrypted"] = data.encrypted
 
     result = await db.prontuarios.update_one(
         {"_id": ObjectId(prontuario_id)},
