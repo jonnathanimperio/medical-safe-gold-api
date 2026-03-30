@@ -872,6 +872,47 @@ async def delete_anexo(
     return {"success": True}
 
 
+@app.get("/prontuarios/search")
+async def search_prontuarios(
+    q: str,
+    request: Request,
+    email: str = Depends(verify_doctor),
+):
+    """Search prontuarios by patient name, CPF, or ID (partial, case-insensitive). Doctor only."""
+    import re
+    safe_q = re.escape(q.strip())
+    if not safe_q:
+        return {"success": True, "data": []}
+    regex = {"$regex": safe_q, "$options": "i"}
+    query = {"$or": [
+        {"patient_name": regex},
+        {"patient_cpf": regex},
+        {"patient_id": regex},
+    ]}
+    docs = await db.prontuarios.find(query).sort("created_at", -1).to_list(length=200)
+    results = []
+    for doc in docs:
+        anexo_count = len(doc.get("anexos", []))
+        results.append({
+            "id": str(doc["_id"]),
+            "patient_id": doc["patient_id"],
+            "appointment_id": doc.get("appointment_id", ""),
+            "doctor_id": doc["doctor_id"],
+            "sintomas": doc["sintomas"],
+            "diagnostico": doc["diagnostico"],
+            "tratamento": doc["tratamento"],
+            "observacoes": doc.get("observacoes", ""),
+            "patient_name": doc.get("patient_name", ""),
+            "patient_cpf": doc.get("patient_cpf", ""),
+            "encrypted": doc.get("encrypted", False),
+            "anexo_count": anexo_count,
+            "created_at": doc["created_at"].isoformat() if doc.get("created_at") else None,
+            "updated_at": doc["updated_at"].isoformat() if doc.get("updated_at") else None,
+        })
+    await log_access(email, "SEARCH_PRONTUARIOS", "", f"query={q}, count={len(results)}", request)
+    return {"success": True, "data": results}
+
+
 @app.get("/prontuarios/{patient_id}")
 async def get_prontuarios(
     patient_id: str,
