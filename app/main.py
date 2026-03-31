@@ -6,7 +6,9 @@ import io
 import base64
 import asyncio
 import secrets
+import urllib.parse
 from datetime import datetime, timedelta, timezone
+from html import escape as html_escape
 from typing import Optional, List
 
 import bcrypt
@@ -802,9 +804,9 @@ async def create_payment_preference(req: CreateCheckoutRequest):
             "email": email,
         },
         "back_urls": {
-            "success": f"{BACKEND_URL}/payments/success?plan={plan_label}&email={email}",
+            "success": f"{BACKEND_URL}/payments/success?plan={plan_label}&email={urllib.parse.quote_plus(email)}",
             "failure": f"{FRONTEND_URL}/#pricing",
-            "pending": f"{BACKEND_URL}/payments/pending?plan={plan_label}&email={email}",
+            "pending": f"{BACKEND_URL}/payments/pending?plan={plan_label}&email={urllib.parse.quote_plus(email)}",
         },
         "auto_return": "approved",
         "notification_url": f"{BACKEND_URL}/payments/webhook",
@@ -877,9 +879,12 @@ async def _process_payment(payment_id: str):
             email = payer_email
             plan = "monthly"
 
-        # Check if we already processed this payment
-        existing = await db.payment_orders.find_one({"mp_payment_id": str(payment_id)})
-        if existing and existing.get("status") == "approved":
+        # Atomic deduplication: try to claim this payment_id first
+        claim_result = await db.payment_orders.find_one_and_update(
+            {"mp_payment_id": str(payment_id), "status": "approved"},
+            {"$set": {"mp_payment_id": str(payment_id)}},
+        )
+        if claim_result:
             print(f"[MP] Payment {payment_id} already processed")
             return
 
@@ -887,20 +892,8 @@ async def _process_payment(payment_id: str):
             # Generate license key
             license_key = generate_license_key()
 
-            # Save license to DB
-            await db.licenses.insert_one({
-                "key": license_key,
-                "email": email,
-                "plan": plan,
-                "status": "pending",
-                "machine_id": None,
-                "created_at": datetime.now(timezone.utc),
-                "activated_at": None,
-                "mp_payment_id": str(payment_id),
-            })
-
-            # Update payment order
-            await db.payment_orders.update_one(
+            # Update payment order atomically to claim this payment
+            claim = await db.payment_orders.find_one_and_update(
                 {"email": email, "plan": plan, "status": {"$ne": "approved"}},
                 {
                     "$set": {
@@ -911,11 +904,30 @@ async def _process_payment(payment_id: str):
                     }
                 },
                 upsert=True,
+                return_document=True,
             )
 
-            # Send license email
-            email_sent = await send_license_email(email, license_key, plan)
-            print(f"[MP] Payment {payment_id} approved. License {license_key} generated for {email}. Email sent: {email_sent}")
+            # Only insert license if we successfully claimed
+            if claim:
+                # Check if license already exists for this payment
+                existing_license = await db.licenses.find_one({"mp_payment_id": str(payment_id)})
+                if not existing_license:
+                    await db.licenses.insert_one({
+                        "key": license_key,
+                        "email": email,
+                        "plan": plan,
+                        "status": "pending",
+                        "machine_id": None,
+                        "created_at": datetime.now(timezone.utc),
+                        "activated_at": None,
+                        "mp_payment_id": str(payment_id),
+                    })
+
+                    # Send license email
+                    email_sent = await send_license_email(email, license_key, plan)
+                    print(f"[MP] Payment {payment_id} approved. License {license_key} generated for {email}. Email sent: {email_sent}")
+                else:
+                    print(f"[MP] License already exists for payment {payment_id}")
 
         else:
             # Update payment status
@@ -932,14 +944,9 @@ async def _process_payment(payment_id: str):
 @app.get("/payments/success", response_class=HTMLResponse)
 async def payment_success(plan: str = "monthly", email: str = ""):
     """Success page after Mercado Pago payment - also processes the payment."""
-    # Try to process payment from query params (Mercado Pago redirects with payment info)
-    payment_id = ""
-    import urllib.parse
-    # Mercado Pago adds these query params on redirect
-    # ?collection_id=XXX&collection_status=approved&payment_id=XXX&status=approved&external_reference=XXX&payment_type=XXX&merchant_order_id=XXX&preference_id=XXX&site_id=XXX&processing_mode=aggregator&merchant_account_id=null
-
-    # We'll use the redirect params to process payment if webhook hasn't fired yet
-    # This is handled by the auto_return=approved setting
+    # Escape user input to prevent XSS
+    email = html_escape(email)
+    plan = html_escape(plan)
 
     plan_name = "Mensal (R$ 69/mes)" if plan == "monthly" else "Anual (R$ 549/ano)"
 
@@ -1037,6 +1044,10 @@ async def payment_success(plan: str = "monthly", email: str = ""):
 @app.get("/payments/pending", response_class=HTMLResponse)
 async def payment_pending(plan: str = "monthly", email: str = ""):
     """Pending payment page."""
+    # Escape user input to prevent XSS
+    email = html_escape(email)
+    plan = html_escape(plan)
+
     html = f"""<!DOCTYPE html>
 <html lang="pt">
 <head>
@@ -1107,7 +1118,6 @@ async def check_payment_status(email_addr: str):
         return {
             "paid": True,
             "plan": order.get("plan"),
-            "license_key": order.get("license_key"),
         }
     return {"paid": False}
 
