@@ -15,6 +15,7 @@ cryptography = ">=42.0.0,<48.0.0"
 pydantic = {version = ">=2.0.0,<3.0.0", extras = ["email"]}
 python-jose = {version = ">=3.3.0,<4.0.0", extras = ["cryptography"]}
 python-multipart = "^0.0.22"
+mercadopago = "^2.3.0"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
