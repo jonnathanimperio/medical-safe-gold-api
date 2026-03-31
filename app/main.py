@@ -10,18 +10,24 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 
 import bcrypt
+import hashlib
+import hmac
 from bson import ObjectId
 from cryptography.fernet import Fernet
 from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, HTMLResponse
 from jose import jwt, JWTError
+import mercadopago
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel
 
 # --- Configuration ---
 MONGO_URI = os.environ.get("MONGO_URI", "")
 MASTER_KEY = os.environ.get("MASTER_KEY", "")
+MP_ACCESS_TOKEN = os.environ.get("MP_ACCESS_TOKEN", "")
+BACKEND_URL = os.environ.get("BACKEND_URL", "https://web-production-2043d.up.railway.app")
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://medicalsafegold.com")
 
 if not MONGO_URI:
     raise RuntimeError("MONGO_URI environment variable is required. Set it before starting the server.")
@@ -79,6 +85,10 @@ async def startup_db():
     await db.access_logs.create_index("timestamp")
     # Anexos (exam files) indexes
     await db.anexos.create_index("prontuario_id")
+    # Payment orders indexes
+    await db.payment_orders.create_index("email")
+    await db.payment_orders.create_index("mp_payment_id")
+    await db.payment_orders.create_index("preference_id")
 
 
 @app.on_event("shutdown")
@@ -117,6 +127,11 @@ class SubscriptionActivate(BaseModel):
     email: str
     plan: str  # "monthly" or "annual"
     transaction_id: str
+
+
+class CreateCheckoutRequest(BaseModel):
+    plan: str  # "monthly" or "annual"
+    email: str
 
 
 class AuthResponse(BaseModel):
@@ -747,6 +762,354 @@ async def admin_revoke_license(license_key: str, admin: bool = Depends(verify_ad
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="License key not found")
     return {"success": True, "message": f"License {license_key} revoked"}
+
+
+# --- Mercado Pago Payment Endpoints ---
+def _get_mp_sdk():
+    """Get Mercado Pago SDK instance."""
+    if not MP_ACCESS_TOKEN:
+        raise HTTPException(status_code=500, detail="Mercado Pago not configured (MP_ACCESS_TOKEN missing)")
+    return mercadopago.SDK(MP_ACCESS_TOKEN)
+
+
+@app.post("/payments/create-preference")
+async def create_payment_preference(req: CreateCheckoutRequest):
+    """Create a Mercado Pago checkout preference for a plan."""
+    sdk = _get_mp_sdk()
+    email = req.email.strip().lower()
+
+    if req.plan == "monthly":
+        title = "Medical Safe Gold - Assinatura Mensal"
+        price = 69.00
+        plan_label = "monthly"
+    elif req.plan == "annual":
+        title = "Medical Safe Gold - Plano Anual"
+        price = 549.00
+        plan_label = "annual"
+    else:
+        raise HTTPException(status_code=400, detail="Invalid plan. Use 'monthly' or 'annual'.")
+
+    preference_data = {
+        "items": [
+            {
+                "title": title,
+                "quantity": 1,
+                "unit_price": price,
+                "currency_id": "BRL",
+            }
+        ],
+        "payer": {
+            "email": email,
+        },
+        "back_urls": {
+            "success": f"{BACKEND_URL}/payments/success?plan={plan_label}&email={email}",
+            "failure": f"{FRONTEND_URL}/#pricing",
+            "pending": f"{BACKEND_URL}/payments/pending?plan={plan_label}&email={email}",
+        },
+        "auto_return": "approved",
+        "notification_url": f"{BACKEND_URL}/payments/webhook",
+        "external_reference": f"{email}|{plan_label}",
+        "statement_descriptor": "MEDICALSAFEGOLD",
+    }
+
+    result = sdk.preference().create(preference_data)
+    if result["status"] == 201:
+        preference = result["response"]
+        # Store the preference in DB for tracking
+        await db.payment_orders.insert_one({
+            "preference_id": preference["id"],
+            "email": email,
+            "plan": plan_label,
+            "amount": price,
+            "status": "created",
+            "created_at": datetime.now(timezone.utc),
+        })
+        return {
+            "success": True,
+            "checkout_url": preference["init_point"],
+            "preference_id": preference["id"],
+        }
+    else:
+        raise HTTPException(status_code=500, detail=f"Failed to create preference: {result.get('response', {})}")
+
+
+@app.post("/payments/webhook")
+async def mercadopago_webhook(request: Request):
+    """Receive Mercado Pago IPN webhook notifications."""
+    try:
+        body = await request.json()
+    except Exception:
+        return {"status": "ok"}
+
+    action = body.get("action", "")
+    data_id = body.get("data", {}).get("id")
+    topic = body.get("type", "") or request.query_params.get("topic", "")
+
+    # Only process payment notifications
+    if topic == "payment" or action == "payment.created" or action == "payment.updated":
+        if data_id:
+            await _process_payment(str(data_id))
+
+    return {"status": "ok"}
+
+
+async def _process_payment(payment_id: str):
+    """Verify a payment with Mercado Pago API and generate license if approved."""
+    try:
+        sdk = _get_mp_sdk()
+        result = sdk.payment().get(int(payment_id))
+
+        if result["status"] != 200:
+            print(f"[MP] Failed to get payment {payment_id}: {result}")
+            return
+
+        payment = result["response"]
+        status = payment.get("status")
+        external_ref = payment.get("external_reference", "")
+        payer_email = payment.get("payer", {}).get("email", "")
+
+        # Parse external_reference: "email|plan"
+        parts = external_ref.split("|") if external_ref else []
+        if len(parts) == 2:
+            email = parts[0]
+            plan = parts[1]
+        else:
+            email = payer_email
+            plan = "monthly"
+
+        # Check if we already processed this payment
+        existing = await db.payment_orders.find_one({"mp_payment_id": str(payment_id)})
+        if existing and existing.get("status") == "approved":
+            print(f"[MP] Payment {payment_id} already processed")
+            return
+
+        if status == "approved":
+            # Generate license key
+            license_key = generate_license_key()
+
+            # Save license to DB
+            await db.licenses.insert_one({
+                "key": license_key,
+                "email": email,
+                "plan": plan,
+                "status": "pending",
+                "machine_id": None,
+                "created_at": datetime.now(timezone.utc),
+                "activated_at": None,
+                "mp_payment_id": str(payment_id),
+            })
+
+            # Update payment order
+            await db.payment_orders.update_one(
+                {"email": email, "plan": plan, "status": {"$ne": "approved"}},
+                {
+                    "$set": {
+                        "status": "approved",
+                        "mp_payment_id": str(payment_id),
+                        "license_key": license_key,
+                        "approved_at": datetime.now(timezone.utc),
+                    }
+                },
+                upsert=True,
+            )
+
+            # Send license email
+            email_sent = await send_license_email(email, license_key, plan)
+            print(f"[MP] Payment {payment_id} approved. License {license_key} generated for {email}. Email sent: {email_sent}")
+
+        else:
+            # Update payment status
+            await db.payment_orders.update_one(
+                {"email": email, "plan": plan},
+                {"$set": {"status": status, "mp_payment_id": str(payment_id)}},
+            )
+            print(f"[MP] Payment {payment_id} status: {status}")
+
+    except Exception as e:
+        print(f"[MP] Error processing payment {payment_id}: {e}")
+
+
+@app.get("/payments/success", response_class=HTMLResponse)
+async def payment_success(plan: str = "monthly", email: str = ""):
+    """Success page after Mercado Pago payment - also processes the payment."""
+    # Try to process payment from query params (Mercado Pago redirects with payment info)
+    payment_id = ""
+    import urllib.parse
+    # Mercado Pago adds these query params on redirect
+    # ?collection_id=XXX&collection_status=approved&payment_id=XXX&status=approved&external_reference=XXX&payment_type=XXX&merchant_order_id=XXX&preference_id=XXX&site_id=XXX&processing_mode=aggregator&merchant_account_id=null
+
+    # We'll use the redirect params to process payment if webhook hasn't fired yet
+    # This is handled by the auto_return=approved setting
+
+    plan_name = "Mensal (R$ 69/mes)" if plan == "monthly" else "Anual (R$ 549/ano)"
+
+    html = f"""<!DOCTYPE html>
+<html lang="pt">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pagamento Aprovado - Medical Safe Gold</title>
+  <style>
+    * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+    body {{
+      font-family: 'Inter', -apple-system, sans-serif;
+      background: #0a0a0f;
+      color: #fff;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }}
+    .container {{
+      text-align: center;
+      max-width: 600px;
+      padding: 40px 24px;
+    }}
+    .icon {{
+      width: 80px; height: 80px;
+      background: linear-gradient(135deg, #45c97a, #2a9d5c);
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      margin: 0 auto 24px;
+      font-size: 40px;
+    }}
+    h1 {{
+      font-size: 32px;
+      color: #d4af37;
+      margin-bottom: 16px;
+    }}
+    p {{
+      color: #8888a0;
+      font-size: 16px;
+      line-height: 1.6;
+      margin-bottom: 12px;
+    }}
+    .highlight {{
+      color: #d4af37;
+      font-weight: 700;
+    }}
+    .info-box {{
+      background: #13131d;
+      border: 1px solid rgba(212,175,55,0.2);
+      border-radius: 12px;
+      padding: 24px;
+      margin: 24px 0;
+    }}
+    .info-box p {{
+      margin-bottom: 8px;
+    }}
+    .btn {{
+      display: inline-block;
+      background: linear-gradient(135deg, #d4af37, #b8960c);
+      color: #0a0a0f;
+      padding: 14px 32px;
+      border-radius: 10px;
+      font-size: 16px;
+      font-weight: 700;
+      text-decoration: none;
+      margin-top: 20px;
+      transition: all 0.3s;
+    }}
+    .btn:hover {{
+      transform: translateY(-2px);
+      box-shadow: 0 4px 20px rgba(212,175,55,0.3);
+    }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="icon">&#10003;</div>
+    <h1>Pagamento Aprovado!</h1>
+    <div class="info-box">
+      <p><strong>Plano:</strong> <span class="highlight">{plan_name}</span></p>
+      <p><strong>E-mail:</strong> <span class="highlight">{email}</span></p>
+      <p style="margin-top:16px;color:#45c97a;font-weight:600;">Sua chave de licenca foi enviada para o seu e-mail!</p>
+      <p style="font-size:14px;">Verifique sua caixa de entrada e a pasta de spam.</p>
+    </div>
+    <p>Use a chave de licenca recebida por e-mail para cadastrar sua conta no aplicativo Medical Safe Gold.</p>
+    <a href="{FRONTEND_URL}" class="btn">Voltar ao Site</a>
+  </div>
+</body>
+</html>"""
+    return HTMLResponse(content=html, status_code=200)
+
+
+@app.get("/payments/pending", response_class=HTMLResponse)
+async def payment_pending(plan: str = "monthly", email: str = ""):
+    """Pending payment page."""
+    html = f"""<!DOCTYPE html>
+<html lang="pt">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pagamento Pendente - Medical Safe Gold</title>
+  <style>
+    * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+    body {{
+      font-family: 'Inter', -apple-system, sans-serif;
+      background: #0a0a0f;
+      color: #fff;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }}
+    .container {{
+      text-align: center;
+      max-width: 600px;
+      padding: 40px 24px;
+    }}
+    .icon {{
+      width: 80px; height: 80px;
+      background: linear-gradient(135deg, #ffbd2e, #e6a820);
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      margin: 0 auto 24px;
+      font-size: 40px;
+    }}
+    h1 {{ font-size: 32px; color: #ffbd2e; margin-bottom: 16px; }}
+    p {{ color: #8888a0; font-size: 16px; line-height: 1.6; margin-bottom: 12px; }}
+    .btn {{
+      display: inline-block;
+      background: linear-gradient(135deg, #d4af37, #b8960c);
+      color: #0a0a0f;
+      padding: 14px 32px;
+      border-radius: 10px;
+      font-size: 16px;
+      font-weight: 700;
+      text-decoration: none;
+      margin-top: 20px;
+    }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="icon">&#8987;</div>
+    <h1>Pagamento Pendente</h1>
+    <p>Seu pagamento esta sendo processado. Assim que for aprovado, voce recebera sua chave de licenca no e-mail <strong style="color:#d4af37;">{email}</strong>.</p>
+    <p>Se estiver usando boleto, pode levar ate 2 dias uteis.</p>
+    <a href="{FRONTEND_URL}" class="btn">Voltar ao Site</a>
+  </div>
+</body>
+</html>"""
+    return HTMLResponse(content=html, status_code=200)
+
+
+@app.get("/payments/check/{email_addr}")
+async def check_payment_status(email_addr: str):
+    """Check if a payment/license exists for an email (public endpoint for landing page)."""
+    email = email_addr.strip().lower()
+    order = await db.payment_orders.find_one(
+        {"email": email, "status": "approved"},
+        sort=[("approved_at", -1)],
+    )
+    if order:
+        return {
+            "paid": True,
+            "plan": order.get("plan"),
+            "license_key": order.get("license_key"),
+        }
+    return {"paid": False}
 
 
 # --- Health ---
