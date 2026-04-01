@@ -419,11 +419,19 @@ async def delete_appointment(
 ):
     """Delete an appointment by ID."""
     from bson import ObjectId
+    from bson.errors import InvalidId
 
-    await db.agendamentos.delete_one({
-        "_id": ObjectId(appointment_id),
+    try:
+        oid = ObjectId(appointment_id)
+    except (InvalidId, Exception):
+        raise HTTPException(status_code=400, detail="Invalid appointment ID")
+
+    result = await db.agendamentos.delete_one({
+        "_id": oid,
         "clinica_id": clinica_id,
     })
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Appointment not found")
     return {"success": True}
 
 
