@@ -3,6 +3,7 @@
 import os
 import csv
 import io
+import uuid
 import base64
 import asyncio
 import secrets
@@ -91,6 +92,10 @@ async def startup_db():
     await db.payment_orders.create_index("email")
     await db.payment_orders.create_index("mp_payment_id")
     await db.payment_orders.create_index("preference_id")
+    # Confirmacoes indexes
+    await db.confirmacoes.create_index("uuid", unique=True)
+    await db.confirmacoes.create_index("clinica_id")
+    await db.confirmacoes.create_index("appointment_id")
 
 
 @app.on_event("shutdown")
@@ -161,6 +166,17 @@ class ForgotPasswordRequest(BaseModel):
 class ResetPasswordRequest(BaseModel):
     token: str
     new_password: str
+
+
+class ConfirmacaoCreate(BaseModel):
+    appointment_id: str
+    patient_name: str
+    patient_whatsapp: str
+    appointment_date: str
+    appointment_time: str
+    doctor_name: str
+    service: str
+    clinica_id: str
 
 
 class ProntuarioCreate(BaseModel):
@@ -1461,3 +1477,320 @@ async def admin_access_logs(
             "timestamp": doc["timestamp"].isoformat() if doc.get("timestamp") else None,
         })
     return {"success": True, "total": len(results), "logs": results}
+
+
+# --- Confirmacao de Consulta (WhatsApp Link) ---
+
+@app.post("/confirmacoes")
+async def create_confirmacao(data: ConfirmacaoCreate, email: str = Depends(verify_token)):
+    """Create a confirmation record for an appointment."""
+    confirmation_uuid = str(uuid.uuid4())
+    doc = {
+        "uuid": confirmation_uuid,
+        "appointment_id": data.appointment_id,
+        "clinica_id": data.clinica_id,
+        "patient_name": data.patient_name,
+        "patient_whatsapp": data.patient_whatsapp,
+        "appointment_date": data.appointment_date,
+        "appointment_time": data.appointment_time,
+        "doctor_name": data.doctor_name,
+        "service": data.service,
+        "status": "Pendente",
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+    }
+    await db.confirmacoes.insert_one(doc)
+    return {"success": True, "uuid": confirmation_uuid, "status": "Pendente"}
+
+
+@app.get("/confirmacoes/{clinica_id}")
+async def list_confirmacoes(clinica_id: str, email: str = Depends(verify_token)):
+    """List all confirmation records for a clinic."""
+    docs = await db.confirmacoes.find({"clinica_id": clinica_id}).sort("created_at", -1).to_list(length=5000)
+    results = []
+    for doc in docs:
+        results.append({
+            "uuid": doc["uuid"],
+            "appointment_id": doc.get("appointment_id", ""),
+            "patient_name": doc.get("patient_name", ""),
+            "patient_whatsapp": doc.get("patient_whatsapp", ""),
+            "appointment_date": doc.get("appointment_date", ""),
+            "appointment_time": doc.get("appointment_time", ""),
+            "doctor_name": doc.get("doctor_name", ""),
+            "service": doc.get("service", ""),
+            "status": doc.get("status", "Pendente"),
+            "updated_at": doc["updated_at"].isoformat() if doc.get("updated_at") else None,
+        })
+    return {"success": True, "data": results}
+
+
+@app.patch("/confirmacoes/{confirmation_uuid}/enviar")
+async def mark_confirmacao_enviado(confirmation_uuid: str, email: str = Depends(verify_token)):
+    """Mark a confirmation as 'Enviado' (sent via WhatsApp)."""
+    result = await db.confirmacoes.update_one(
+        {"uuid": confirmation_uuid, "status": {"$nin": ["Confirmado", "Cancelado"]}},
+        {"$set": {"status": "Enviado", "updated_at": datetime.now(timezone.utc)}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Confirmation not found")
+    return {"success": True, "status": "Enviado"}
+
+
+@app.get("/confirmar/{confirmation_uuid}", response_class=HTMLResponse)
+async def confirmation_page(confirmation_uuid: str):
+    """Public page for patient to confirm/cancel appointment."""
+    doc = await db.confirmacoes.find_one({"uuid": confirmation_uuid})
+    if not doc:
+        return HTMLResponse(content=_confirmation_html_not_found(), status_code=404)
+
+    status = doc.get("status", "Pendente")
+    if status in ("Confirmado", "Cancelado"):
+        return HTMLResponse(content=_confirmation_html_already_responded(
+            doc.get("patient_name", ""),
+            doc.get("doctor_name", ""),
+            doc.get("appointment_date", ""),
+            doc.get("appointment_time", ""),
+            doc.get("service", ""),
+            status,
+        ))
+
+    return HTMLResponse(content=_confirmation_html_form(
+        confirmation_uuid,
+        doc.get("patient_name", ""),
+        doc.get("doctor_name", ""),
+        doc.get("appointment_date", ""),
+        doc.get("appointment_time", ""),
+        doc.get("service", ""),
+    ))
+
+
+@app.post("/confirmar/{confirmation_uuid}/confirmar")
+async def confirm_appointment(confirmation_uuid: str):
+    """Public endpoint: patient confirms attendance."""
+    result = await db.confirmacoes.update_one(
+        {"uuid": confirmation_uuid, "status": {"$nin": ["Confirmado", "Cancelado"]}},
+        {"$set": {"status": "Confirmado", "updated_at": datetime.now(timezone.utc)}},
+    )
+    if result.matched_count == 0:
+        doc = await db.confirmacoes.find_one({"uuid": confirmation_uuid})
+        if not doc:
+            raise HTTPException(status_code=404, detail="Not found")
+        return HTMLResponse(content=_confirmation_html_already_responded(
+            doc.get("patient_name", ""),
+            doc.get("doctor_name", ""),
+            doc.get("appointment_date", ""),
+            doc.get("appointment_time", ""),
+            doc.get("service", ""),
+            doc.get("status", ""),
+        ))
+    doc = await db.confirmacoes.find_one({"uuid": confirmation_uuid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Not found")
+    return HTMLResponse(content=_confirmation_html_success(
+        doc.get("patient_name", ""),
+        doc.get("doctor_name", ""),
+        doc.get("appointment_date", ""),
+        doc.get("appointment_time", ""),
+    ))
+
+
+@app.post("/confirmar/{confirmation_uuid}/cancelar")
+async def cancel_appointment(confirmation_uuid: str):
+    """Public endpoint: patient cancels attendance."""
+    result = await db.confirmacoes.update_one(
+        {"uuid": confirmation_uuid, "status": {"$nin": ["Confirmado", "Cancelado"]}},
+        {"$set": {"status": "Cancelado", "updated_at": datetime.now(timezone.utc)}},
+    )
+    if result.matched_count == 0:
+        doc = await db.confirmacoes.find_one({"uuid": confirmation_uuid})
+        if not doc:
+            raise HTTPException(status_code=404, detail="Not found")
+        return HTMLResponse(content=_confirmation_html_already_responded(
+            doc.get("patient_name", ""),
+            doc.get("doctor_name", ""),
+            doc.get("appointment_date", ""),
+            doc.get("appointment_time", ""),
+            doc.get("service", ""),
+            doc.get("status", ""),
+        ))
+    doc = await db.confirmacoes.find_one({"uuid": confirmation_uuid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Not found")
+    return HTMLResponse(content=_confirmation_html_cancelled(
+        doc.get("patient_name", ""),
+        doc.get("doctor_name", ""),
+        doc.get("appointment_date", ""),
+        doc.get("appointment_time", ""),
+    ))
+
+
+# --- Confirmation HTML Templates ---
+
+def _confirmation_base_css() -> str:
+    return """
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      body {
+        font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+        background: linear-gradient(135deg, #0a0a0f 0%, #101018 50%, #13131d 100%);
+        min-height: 100vh; display: flex; align-items: center; justify-content: center;
+        color: #fff; padding: 20px;
+      }
+      .card {
+        background: #13131d; border: 1px solid rgba(212,175,55,0.2);
+        border-radius: 16px; padding: 40px 32px; max-width: 480px; width: 100%;
+        text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+      }
+      .logo { font-size: 28px; font-weight: 700; color: #d4af37; margin-bottom: 8px; }
+      .subtitle { color: #8888a0; font-size: 14px; margin-bottom: 32px; }
+      .patient-name { font-size: 22px; font-weight: 600; color: #fff; margin-bottom: 4px; }
+      .doctor-name { color: #d4af37; font-size: 16px; margin-bottom: 24px; }
+      .info-row {
+        display: flex; align-items: center; justify-content: center; gap: 8px;
+        color: #8888a0; font-size: 15px; margin-bottom: 8px;
+      }
+      .info-row svg { width: 18px; height: 18px; fill: #d4af37; }
+      .divider { border: none; border-top: 1px solid rgba(255,255,255,0.06); margin: 24px 0; }
+      .question { font-size: 18px; font-weight: 500; color: #fff; margin-bottom: 24px; }
+      .btn-row { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+      .btn {
+        padding: 14px 32px; border: none; border-radius: 10px; font-size: 16px;
+        font-weight: 600; cursor: pointer; transition: all 0.2s; min-width: 160px;
+      }
+      .btn-confirm {
+        background: linear-gradient(135deg, #45c97a, #2ea85e); color: #fff;
+      }
+      .btn-confirm:hover { transform: translateY(-2px); box-shadow: 0 4px 16px rgba(69,201,122,0.3); }
+      .btn-cancel {
+        background: linear-gradient(135deg, #e05577, #c03050); color: #fff;
+      }
+      .btn-cancel:hover { transform: translateY(-2px); box-shadow: 0 4px 16px rgba(224,85,119,0.3); }
+      .status-icon { font-size: 64px; margin-bottom: 16px; }
+      .status-msg { font-size: 18px; color: #fff; margin-bottom: 8px; font-weight: 500; }
+      .status-sub { color: #8888a0; font-size: 14px; }
+      form { display: inline; }
+    </style>
+    """
+
+
+def _confirmation_html_form(uuid_str: str, patient: str, doctor: str, date: str, time: str, service: str) -> str:
+    patient_safe = html_escape(patient)
+    doctor_safe = html_escape(doctor)
+    date_safe = html_escape(date)
+    time_safe = html_escape(time)
+    service_safe = html_escape(service)
+    return f"""<!DOCTYPE html>
+<html lang="pt-BR"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Confirmar Consulta - Medical Safe Gold</title>{_confirmation_base_css()}
+</head><body>
+<div class="card">
+  <div class="logo">Medical Safe Gold</div>
+  <div class="subtitle">Confirmacao de Consulta</div>
+  <div class="patient-name">Ola, {patient_safe}!</div>
+  <div class="doctor-name">Consulta com Dr(a). {doctor_safe}</div>
+  <div class="info-row">
+    <svg viewBox="0 0 24 24"><path d="M19 3h-1V1h-2v2H8V1H6v2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H5V8h14v11z"/></svg>
+    <span>{date_safe}</span>
+  </div>
+  <div class="info-row">
+    <svg viewBox="0 0 24 24"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67z"/></svg>
+    <span>{time_safe}</span>
+  </div>
+  <div class="info-row">
+    <svg viewBox="0 0 24 24"><path d="M20 6h-4V4c0-1.1-.9-2-2-2h-4c-1.1 0-2 .9-2 2v2H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm-6 0h-4V4h4v2z"/></svg>
+    <span>{service_safe}</span>
+  </div>
+  <hr class="divider">
+  <div class="question">Confirma sua presenca?</div>
+  <div class="btn-row">
+    <form method="POST" action="/confirmar/{uuid_str}/confirmar">
+      <button type="submit" class="btn btn-confirm">Sim, Confirmar</button>
+    </form>
+    <form method="POST" action="/confirmar/{uuid_str}/cancelar">
+      <button type="submit" class="btn btn-cancel">Nao, Cancelar</button>
+    </form>
+  </div>
+</div>
+</body></html>"""
+
+
+def _confirmation_html_success(patient: str, doctor: str, date: str, time: str) -> str:
+    patient_safe = html_escape(patient)
+    doctor_safe = html_escape(doctor)
+    date_safe = html_escape(date)
+    time_safe = html_escape(time)
+    return f"""<!DOCTYPE html>
+<html lang="pt-BR"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Consulta Confirmada - Medical Safe Gold</title>{_confirmation_base_css()}
+</head><body>
+<div class="card">
+  <div class="logo">Medical Safe Gold</div>
+  <div class="status-icon" style="color:#45c97a;">&#10003;</div>
+  <div class="status-msg">Consulta Confirmada!</div>
+  <div class="status-sub">{patient_safe}, sua consulta com Dr(a). {doctor_safe} em {date_safe} as {time_safe} foi confirmada com sucesso.</div>
+  <hr class="divider">
+  <div class="status-sub">Obrigado! Nos vemos em breve.</div>
+</div>
+</body></html>"""
+
+
+def _confirmation_html_cancelled(patient: str, doctor: str, date: str, time: str) -> str:
+    patient_safe = html_escape(patient)
+    doctor_safe = html_escape(doctor)
+    date_safe = html_escape(date)
+    time_safe = html_escape(time)
+    return f"""<!DOCTYPE html>
+<html lang="pt-BR"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Consulta Cancelada - Medical Safe Gold</title>{_confirmation_base_css()}
+</head><body>
+<div class="card">
+  <div class="logo">Medical Safe Gold</div>
+  <div class="status-icon" style="color:#e05577;">&#10007;</div>
+  <div class="status-msg">Consulta Cancelada</div>
+  <div class="status-sub">{patient_safe}, sua consulta com Dr(a). {doctor_safe} em {date_safe} as {time_safe} foi cancelada.</div>
+  <hr class="divider">
+  <div class="status-sub">Se precisar reagendar, entre em contato com a clinica.</div>
+</div>
+</body></html>"""
+
+
+def _confirmation_html_already_responded(patient: str, doctor: str, date: str, time: str, service: str, status: str) -> str:
+    patient_safe = html_escape(patient)
+    doctor_safe = html_escape(doctor)
+    date_safe = html_escape(date)
+    time_safe = html_escape(time)
+    if status == "Confirmado":
+        icon = '<div class="status-icon" style="color:#45c97a;">&#10003;</div>'
+        msg = "Consulta ja Confirmada"
+        sub = f"{patient_safe}, sua consulta com Dr(a). {doctor_safe} em {date_safe} as {time_safe} ja foi confirmada anteriormente."
+    else:
+        icon = '<div class="status-icon" style="color:#e05577;">&#10007;</div>'
+        msg = "Consulta ja Cancelada"
+        sub = f"{patient_safe}, sua consulta com Dr(a). {doctor_safe} em {date_safe} as {time_safe} ja foi cancelada anteriormente."
+    return f"""<!DOCTYPE html>
+<html lang="pt-BR"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{msg} - Medical Safe Gold</title>{_confirmation_base_css()}
+</head><body>
+<div class="card">
+  <div class="logo">Medical Safe Gold</div>
+  {icon}
+  <div class="status-msg">{msg}</div>
+  <div class="status-sub">{sub}</div>
+  <hr class="divider">
+  <div class="status-sub">Se precisar de algo, entre em contato com a clinica.</div>
+</div>
+</body></html>"""
+
+
+def _confirmation_html_not_found() -> str:
+    return f"""<!DOCTYPE html>
+<html lang="pt-BR"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Nao Encontrado - Medical Safe Gold</title>{_confirmation_base_css()}
+</head><body>
+<div class="card">
+  <div class="logo">Medical Safe Gold</div>
+  <div class="status-icon" style="color:#8888a0;">?</div>
+  <div class="status-msg">Link Invalido</div>
+  <div class="status-sub">Este link de confirmacao nao foi encontrado ou expirou.</div>
+</div>
+</body></html>"""
