@@ -1528,7 +1528,7 @@ async def list_confirmacoes(clinica_id: str, email: str = Depends(verify_token))
 async def mark_confirmacao_enviado(confirmation_uuid: str, email: str = Depends(verify_token)):
     """Mark a confirmation as 'Enviado' (sent via WhatsApp)."""
     result = await db.confirmacoes.update_one(
-        {"uuid": confirmation_uuid},
+        {"uuid": confirmation_uuid, "status": {"$nin": ["Confirmado", "Cancelado"]}},
         {"$set": {"status": "Enviado", "updated_at": datetime.now(timezone.utc)}},
     )
     if result.matched_count == 0:
@@ -1584,6 +1584,8 @@ async def confirm_appointment(confirmation_uuid: str):
             doc.get("status", ""),
         ))
     doc = await db.confirmacoes.find_one({"uuid": confirmation_uuid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Not found")
     return HTMLResponse(content=_confirmation_html_success(
         doc.get("patient_name", ""),
         doc.get("doctor_name", ""),
@@ -1612,6 +1614,8 @@ async def cancel_appointment(confirmation_uuid: str):
             doc.get("status", ""),
         ))
     doc = await db.confirmacoes.find_one({"uuid": confirmation_uuid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Not found")
     return HTMLResponse(content=_confirmation_html_cancelled(
         doc.get("patient_name", ""),
         doc.get("doctor_name", ""),
