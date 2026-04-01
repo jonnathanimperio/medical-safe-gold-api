@@ -424,9 +424,6 @@ async def register(req: RegisterRequest):
     license_doc = await db.licenses.find_one({"key": license_key})
     if not license_doc:
         return AuthResponse(success=False, error="INVALID_LICENSE_KEY")
-    if license_doc.get("status") == "activated":
-        if license_doc.get("email") != email:
-            return AuthResponse(success=False, error="LICENSE_ALREADY_USED")
     if license_doc.get("status") == "revoked":
         return AuthResponse(success=False, error="LICENSE_REVOKED")
 
@@ -434,8 +431,26 @@ async def register(req: RegisterRequest):
     if existing:
         return AuthResponse(success=False, error="USER_EXISTS")
 
+    # If license is already activated, allow additional users (e.g. receptionist)
+    # but use the original doctor's email as clinica_id so they share data
+    clinica_id = email
+    original_fernet_key = None
+    if license_doc.get("status") == "activated":
+        # Find the original user who activated this license to share clinic
+        original_user = await db.users.find_one({"license_key": license_key})
+        if original_user:
+            clinica_id = original_user["email"]
+            # Share the same Fernet key so both users can decrypt the same data
+            try:
+                original_fernet_key = decrypt_user_key(original_user["fernet_key_encrypted"])
+            except Exception:
+                pass
+
     password_hash = bcrypt.hashpw(req.password.encode(), bcrypt.gensalt(10))
-    user_fernet_key = generate_user_fernet_key()
+    if original_fernet_key:
+        user_fernet_key = original_fernet_key
+    else:
+        user_fernet_key = generate_user_fernet_key()
     encrypted_fernet_key = encrypt_user_key(user_fernet_key)
 
     plan = license_doc.get("plan", "monthly")
@@ -457,6 +472,7 @@ async def register(req: RegisterRequest):
         "machine_id": req.machine_id,
         "fernet_key_encrypted": encrypted_fernet_key,
         "license_key": license_key,
+        "clinica_id": clinica_id,
         "role": role,
         "subscription_status": "active",
         "subscription_plan": plan,
@@ -465,18 +481,19 @@ async def register(req: RegisterRequest):
         "last_login": datetime.now(timezone.utc),
     })
 
-    # Bind email + machine_id to license
-    await db.licenses.update_one(
-        {"key": license_key},
-        {"$set": {
-            "status": "activated", "email": email,
-            "machine_id": req.machine_id, "activated_at": datetime.now(timezone.utc),
-        }},
-    )
+    # Bind machine_id to license on first activation
+    if license_doc.get("status") != "activated":
+        await db.licenses.update_one(
+            {"key": license_key},
+            {"$set": {
+                "status": "activated", "email": email,
+                "machine_id": req.machine_id, "activated_at": datetime.now(timezone.utc),
+            }},
+        )
 
     token = create_jwt_token(email)
     return AuthResponse(
-        success=True, token=token, fernet_key=user_fernet_key, clinica_id=email,
+        success=True, token=token, fernet_key=user_fernet_key, clinica_id=clinica_id,
         subscription_status="active", subscription_plan=plan, subscription_expires=expires.isoformat(),
         role=role,
     )
@@ -528,11 +545,14 @@ async def login(req: LoginRequest):
 
     token = create_jwt_token(email)
 
+    # Use stored clinica_id if available, otherwise fall back to email
+    clinica_id = user.get("clinica_id", email)
+
     return AuthResponse(
         success=True,
         token=token,
         fernet_key=user_fernet_key,
-        clinica_id=email,
+        clinica_id=clinica_id,
         subscription_status=user.get("subscription_status", "trial"),
         subscription_plan=user.get("subscription_plan"),
         subscription_expires=user.get("subscription_expires", "").isoformat()
