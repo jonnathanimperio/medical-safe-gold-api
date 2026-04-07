@@ -36,7 +36,9 @@ if not MONGO_URI:
     raise RuntimeError("MONGO_URI environment variable is required. Set it before starting the server.")
 if not MASTER_KEY:
     raise RuntimeError("MASTER_KEY environment variable is required. Set it before starting the server.")
-JWT_SECRET = os.environ.get("JWT_SECRET", secrets.token_urlsafe(64))
+# Derive JWT_SECRET from MASTER_KEY so it stays consistent across server restarts
+_default_jwt = hashlib.sha256(MASTER_KEY.encode()).hexdigest()
+JWT_SECRET = os.environ.get("JWT_SECRET", _default_jwt)
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_HOURS = 24
 TRIAL_DAYS = 7
