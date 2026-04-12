@@ -55,7 +55,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "")
 
 # --- App ---
-app = FastAPI(title="Medical Safe Gold API", version="2.0.0")
+app = FastAPI(title="Medical Safe Gold API", version="4.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -191,6 +191,14 @@ class ProntuarioCreate(BaseModel):
     patient_name: Optional[str] = ""
     patient_cpf: Optional[str] = ""
     encrypted: Optional[bool] = False
+    # New v4 fields
+    data_nascimento: Optional[str] = ""
+    contato: Optional[str] = ""
+    historico_clinico: Optional[str] = ""
+    anamnese: Optional[str] = ""
+    prescricoes: Optional[str] = ""
+    cid10_codigo: Optional[str] = ""
+    cid10_descricao: Optional[str] = ""
 
 
 class ProntuarioUpdate(BaseModel):
@@ -199,6 +207,40 @@ class ProntuarioUpdate(BaseModel):
     tratamento: Optional[str] = None
     observacoes: Optional[str] = None
     encrypted: Optional[bool] = None
+    # New v4 fields
+    data_nascimento: Optional[str] = None
+    contato: Optional[str] = None
+    historico_clinico: Optional[str] = None
+    anamnese: Optional[str] = None
+    prescricoes: Optional[str] = None
+    cid10_codigo: Optional[str] = None
+    cid10_descricao: Optional[str] = None
+
+
+class EvolucaoCreate(BaseModel):
+    prontuario_id: str
+    patient_id: str
+    descricao: str
+    tipo: Optional[str] = "evolucao"  # evolucao, retificacao
+    referencia_id: Optional[str] = None  # ID of original record for retificacao
+
+
+class ExameCreate(BaseModel):
+    prontuario_id: str
+    patient_id: str
+    tipo_exame: str  # e.g. "Hemograma", "Glicemia", etc.
+    descricao: Optional[str] = ""
+    interpretacao: Optional[str] = ""
+    data_exame: Optional[str] = ""
+    profissional_responsavel: Optional[str] = ""
+
+
+class ExameUpdate(BaseModel):
+    tipo_exame: Optional[str] = None
+    descricao: Optional[str] = None
+    interpretacao: Optional[str] = None
+    data_exame: Optional[str] = None
+    profissional_responsavel: Optional[str] = None
 
 
 # --- Helpers ---
@@ -261,18 +303,53 @@ async def verify_doctor(email: str = Depends(verify_token)) -> str:
 
 
 async def log_access(user_email: str, action: str, prontuario_id: str = "", details: str = "", request: Optional[Request] = None):
-    """Log access to prontuario data for LGPD compliance."""
+    """Log access to prontuario data for LGPD compliance. Immutable audit trail."""
     client_ip = ""
     if request:
         client_ip = request.client.host if request.client else ""
-    await db.access_logs.insert_one({
+    # Insert into immutable audit_trail collection (no delete endpoint exists)
+    log_doc = {
         "user_email": user_email,
         "action": action,
         "prontuario_id": prontuario_id,
         "details": details,
         "ip": client_ip,
         "timestamp": datetime.now(timezone.utc),
-    })
+    }
+    await db.access_logs.insert_one(log_doc)
+    # Also insert into immutable audit_trail (separate collection, never deleted)
+    await db.audit_trail.insert_one(log_doc.copy())
+
+
+def compute_integrity_hash(data: dict) -> str:
+    """Compute SHA-256 hash for data integrity verification."""
+    # Create a deterministic string from key clinical fields
+    fields = ["sintomas", "diagnostico", "tratamento", "observacoes",
+              "anamnese", "historico_clinico", "prescricoes",
+              "cid10_codigo", "cid10_descricao"]
+    content = "|".join(str(data.get(f, "")) for f in fields)
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def is_editable(created_at: datetime) -> bool:
+    """Check if a prontuario record is still editable.
+    Records can only be edited on the same calendar day (UTC) they were created.
+    After midnight UTC of the creation day, they become read-only."""
+    if not created_at:
+        return False
+    now = datetime.now(timezone.utc)
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    return now.date() == created_at.date()
+
+
+def validate_object_id(id_str: str, entity_name: str = "Record") -> ObjectId:
+    """Validate and convert a string to ObjectId, raising 400 if invalid."""
+    from bson.errors import InvalidId
+    try:
+        return ObjectId(id_str)
+    except (InvalidId, TypeError):
+        raise HTTPException(status_code=400, detail=f"ID inválido para {entity_name}: {id_str}")
 
 
 def check_subscription(user: dict) -> tuple[bool, str]:
@@ -1208,9 +1285,25 @@ async def create_prontuario(
         "patient_name": data.patient_name or "",
         "patient_cpf": data.patient_cpf or "",
         "encrypted": data.encrypted or False,
+        # New v4 fields
+        "data_nascimento": data.data_nascimento or "",
+        "contato": data.contato or "",
+        "historico_clinico": data.historico_clinico or "",
+        "anamnese": data.anamnese or "",
+        "prescricoes": data.prescricoes or "",
+        "cid10_codigo": data.cid10_codigo or "",
+        "cid10_descricao": data.cid10_descricao or "",
         "anexos": [],
         "created_at": datetime.now(timezone.utc),
         "updated_at": datetime.now(timezone.utc),
+    }
+    # Compute integrity hash for tamper detection
+    doc["integrity_hash"] = compute_integrity_hash(doc)
+    # Digital signature preparation: store signing metadata
+    doc["assinatura"] = {
+        "doctor_email": email,
+        "signed_at": datetime.now(timezone.utc).isoformat(),
+        "hash": doc["integrity_hash"],
     }
     result = await db.prontuarios.insert_one(doc)
     await log_access(email, "CREATE_PRONTUARIO", str(result.inserted_id), f"patient={data.patient_id}", request)
@@ -1291,6 +1384,39 @@ async def delete_anexo(
     return {"success": True}
 
 
+def _serialize_prontuario(doc: dict) -> dict:
+    """Serialize a prontuario document for API response, including v4 fields."""
+    anexo_count = len(doc.get("anexos", []))
+    created_at = doc.get("created_at")
+    return {
+        "id": str(doc["_id"]),
+        "patient_id": doc["patient_id"],
+        "appointment_id": doc.get("appointment_id", ""),
+        "doctor_id": doc["doctor_id"],
+        "sintomas": doc["sintomas"],
+        "diagnostico": doc["diagnostico"],
+        "tratamento": doc["tratamento"],
+        "observacoes": doc.get("observacoes", ""),
+        "patient_name": doc.get("patient_name", ""),
+        "patient_cpf": doc.get("patient_cpf", ""),
+        "encrypted": doc.get("encrypted", False),
+        # v4 fields
+        "data_nascimento": doc.get("data_nascimento", ""),
+        "contato": doc.get("contato", ""),
+        "historico_clinico": doc.get("historico_clinico", ""),
+        "anamnese": doc.get("anamnese", ""),
+        "prescricoes": doc.get("prescricoes", ""),
+        "cid10_codigo": doc.get("cid10_codigo", ""),
+        "cid10_descricao": doc.get("cid10_descricao", ""),
+        "integrity_hash": doc.get("integrity_hash", ""),
+        "assinatura": doc.get("assinatura"),
+        "locked": not is_editable(created_at) if created_at else False,
+        "anexo_count": anexo_count,
+        "created_at": doc["created_at"].isoformat() if doc.get("created_at") else None,
+        "updated_at": doc["updated_at"].isoformat() if doc.get("updated_at") else None,
+    }
+
+
 @app.get("/prontuarios/search")
 async def search_prontuarios(
     q: str,
@@ -1309,25 +1435,7 @@ async def search_prontuarios(
         {"patient_id": regex},
     ]}
     docs = await db.prontuarios.find(query).sort("created_at", -1).to_list(length=200)
-    results = []
-    for doc in docs:
-        anexo_count = len(doc.get("anexos", []))
-        results.append({
-            "id": str(doc["_id"]),
-            "patient_id": doc["patient_id"],
-            "appointment_id": doc.get("appointment_id", ""),
-            "doctor_id": doc["doctor_id"],
-            "sintomas": doc["sintomas"],
-            "diagnostico": doc["diagnostico"],
-            "tratamento": doc["tratamento"],
-            "observacoes": doc.get("observacoes", ""),
-            "patient_name": doc.get("patient_name", ""),
-            "patient_cpf": doc.get("patient_cpf", ""),
-            "encrypted": doc.get("encrypted", False),
-            "anexo_count": anexo_count,
-            "created_at": doc["created_at"].isoformat() if doc.get("created_at") else None,
-            "updated_at": doc["updated_at"].isoformat() if doc.get("updated_at") else None,
-        })
+    results = [_serialize_prontuario(doc) for doc in docs]
     await log_access(email, "SEARCH_PRONTUARIOS", "", f"query={q}, count={len(results)}", request)
     return {"success": True, "data": results}
 
@@ -1340,25 +1448,7 @@ async def get_prontuarios(
 ):
     """Get all prontuarios for a patient. Doctor only."""
     docs = await db.prontuarios.find({"patient_id": patient_id}).sort("created_at", -1).to_list(length=1000)
-    results = []
-    for doc in docs:
-        anexo_count = len(doc.get("anexos", []))
-        results.append({
-            "id": str(doc["_id"]),
-            "patient_id": doc["patient_id"],
-            "appointment_id": doc.get("appointment_id", ""),
-            "doctor_id": doc["doctor_id"],
-            "sintomas": doc["sintomas"],
-            "diagnostico": doc["diagnostico"],
-            "tratamento": doc["tratamento"],
-            "observacoes": doc.get("observacoes", ""),
-            "patient_name": doc.get("patient_name", ""),
-            "patient_cpf": doc.get("patient_cpf", ""),
-            "encrypted": doc.get("encrypted", False),
-            "anexo_count": anexo_count,
-            "created_at": doc["created_at"].isoformat() if doc.get("created_at") else None,
-            "updated_at": doc["updated_at"].isoformat() if doc.get("updated_at") else None,
-        })
+    results = [_serialize_prontuario(doc) for doc in docs]
     await log_access(email, "VIEW_PRONTUARIOS", "", f"patient={patient_id}, count={len(results)}", request)
     return {"success": True, "data": results}
 
@@ -1370,18 +1460,34 @@ async def update_prontuario(
     request: Request,
     email: str = Depends(verify_doctor),
 ):
-    """Update a prontuario. Doctor only."""
+    """Update a prontuario. Doctor only. Blocked after midnight of creation day."""
+    # Fetch existing record to check editability
+    existing = await db.prontuarios.find_one({"_id": ObjectId(prontuario_id)})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Prontuario not found")
+
+    created_at = existing.get("created_at")
+    if created_at and not is_editable(created_at):
+        await log_access(email, "UPDATE_PRONTUARIO_BLOCKED", prontuario_id,
+                         "Edit blocked: record locked after midnight", request)
+        raise HTTPException(
+            status_code=403,
+            detail="Prontuário bloqueado para edição. Registros só podem ser editados no mesmo dia da criação. Use o sistema de retificação para correções."
+        )
+
     update_fields = {"updated_at": datetime.now(timezone.utc)}
-    if data.sintomas is not None:
-        update_fields["sintomas"] = data.sintomas
-    if data.diagnostico is not None:
-        update_fields["diagnostico"] = data.diagnostico
-    if data.tratamento is not None:
-        update_fields["tratamento"] = data.tratamento
-    if data.observacoes is not None:
-        update_fields["observacoes"] = data.observacoes
+    for field_name in ["sintomas", "diagnostico", "tratamento", "observacoes",
+                       "data_nascimento", "contato", "historico_clinico",
+                       "anamnese", "prescricoes", "cid10_codigo", "cid10_descricao"]:
+        value = getattr(data, field_name, None)
+        if value is not None:
+            update_fields[field_name] = value
     if data.encrypted is not None:
         update_fields["encrypted"] = data.encrypted
+
+    # Recompute integrity hash with merged data
+    merged = {**existing, **update_fields}
+    update_fields["integrity_hash"] = compute_integrity_hash(merged)
 
     result = await db.prontuarios.update_one(
         {"_id": ObjectId(prontuario_id)},
@@ -1399,14 +1505,317 @@ async def delete_prontuario(
     request: Request,
     email: str = Depends(verify_doctor),
 ):
-    """Delete a prontuario. Doctor only."""
-    result = await db.prontuarios.delete_one({"_id": ObjectId(prontuario_id)})
-    if result.deleted_count == 0:
+    """Prontuário deletion is PROHIBITED. Medical records must be retained for 20+ years."""
+    await log_access(email, "DELETE_PRONTUARIO_BLOCKED", prontuario_id,
+                     "Deletion attempt blocked: medical records cannot be deleted", request)
+    raise HTTPException(
+        status_code=403,
+        detail="Exclusão de prontuários é proibida. Registros médicos devem ser mantidos por no mínimo 20 anos conforme legislação vigente."
+    )
+
+
+# --- Evoluções (Medical Evolutions - Append Only) ---
+
+@app.post("/prontuarios/{prontuario_id}/evolucoes")
+async def create_evolucao(
+    prontuario_id: str,
+    data: EvolucaoCreate,
+    request: Request,
+    email: str = Depends(verify_doctor),
+):
+    """Add a medical evolution to a prontuario. Append-only, cannot be edited or deleted."""
+    # Verify prontuario exists
+    oid = validate_object_id(prontuario_id, "Prontuário")
+    pront = await db.prontuarios.find_one({"_id": oid})
+    if not pront:
         raise HTTPException(status_code=404, detail="Prontuario not found")
-    # Also delete associated anexos
-    await db.anexos.delete_many({"prontuario_id": prontuario_id})
-    await log_access(email, "DELETE_PRONTUARIO", prontuario_id, "", request)
+
+    doc = {
+        "prontuario_id": prontuario_id,
+        "patient_id": data.patient_id,
+        "doctor_id": email,
+        "descricao": data.descricao,
+        "tipo": data.tipo or "evolucao",
+        "referencia_id": data.referencia_id or "",
+        "created_at": datetime.now(timezone.utc),
+        "integrity_hash": hashlib.sha256(data.descricao.encode("utf-8")).hexdigest(),
+    }
+    result = await db.evolucoes.insert_one(doc)
+    await log_access(email, "CREATE_EVOLUCAO", prontuario_id, f"tipo={data.tipo}", request)
+    return {"success": True, "id": str(result.inserted_id)}
+
+
+@app.get("/prontuarios/{prontuario_id}/evolucoes")
+async def list_evolucoes(
+    prontuario_id: str,
+    request: Request,
+    email: str = Depends(verify_doctor),
+):
+    """List all evolutions for a prontuario (chronological, append-only). Doctor only."""
+    docs = await db.evolucoes.find({"prontuario_id": prontuario_id}).sort("created_at", 1).to_list(length=1000)
+    results = []
+    for doc in docs:
+        results.append({
+            "id": str(doc["_id"]),
+            "prontuario_id": doc["prontuario_id"],
+            "patient_id": doc.get("patient_id", ""),
+            "doctor_id": doc["doctor_id"],
+            "descricao": doc["descricao"],
+            "tipo": doc.get("tipo", "evolucao"),
+            "referencia_id": doc.get("referencia_id", ""),
+            "integrity_hash": doc.get("integrity_hash", ""),
+            "created_at": doc["created_at"].isoformat() if doc.get("created_at") else None,
+        })
+    await log_access(email, "LIST_EVOLUCOES", prontuario_id, f"count={len(results)}", request)
+    return {"success": True, "data": results}
+
+
+# --- Exames (Exams within Prontuario) ---
+
+@app.post("/prontuarios/{prontuario_id}/exames")
+async def create_exame(
+    prontuario_id: str,
+    data: ExameCreate,
+    request: Request,
+    email: str = Depends(verify_doctor),
+):
+    """Add an exam record to a prontuario. Doctor only."""
+    oid = validate_object_id(prontuario_id, "Prontuário")
+    pront = await db.prontuarios.find_one({"_id": oid})
+    if not pront:
+        raise HTTPException(status_code=404, detail="Prontuario not found")
+
+    doc = {
+        "prontuario_id": prontuario_id,
+        "patient_id": data.patient_id,
+        "doctor_id": email,
+        "tipo_exame": data.tipo_exame,
+        "descricao": data.descricao or "",
+        "interpretacao": data.interpretacao or "",
+        "data_exame": data.data_exame or "",
+        "profissional_responsavel": data.profissional_responsavel or email,
+        "anexos": [],
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+    }
+    result = await db.exames.insert_one(doc)
+    await log_access(email, "CREATE_EXAME", prontuario_id, f"tipo={data.tipo_exame}", request)
+    return {"success": True, "id": str(result.inserted_id)}
+
+
+@app.get("/prontuarios/{prontuario_id}/exames")
+async def list_exames(
+    prontuario_id: str,
+    request: Request,
+    email: str = Depends(verify_doctor),
+):
+    """List all exams for a prontuario, ordered by date. Doctor only."""
+    docs = await db.exames.find({"prontuario_id": prontuario_id}).sort("created_at", -1).to_list(length=500)
+    results = []
+    for doc in docs:
+        results.append({
+            "id": str(doc["_id"]),
+            "prontuario_id": doc["prontuario_id"],
+            "patient_id": doc.get("patient_id", ""),
+            "doctor_id": doc["doctor_id"],
+            "tipo_exame": doc["tipo_exame"],
+            "descricao": doc.get("descricao", ""),
+            "interpretacao": doc.get("interpretacao", ""),
+            "data_exame": doc.get("data_exame", ""),
+            "profissional_responsavel": doc.get("profissional_responsavel", ""),
+            "anexos": doc.get("anexos", []),
+            "created_at": doc["created_at"].isoformat() if doc.get("created_at") else None,
+            "updated_at": doc["updated_at"].isoformat() if doc.get("updated_at") else None,
+        })
+    await log_access(email, "LIST_EXAMES", prontuario_id, f"count={len(results)}", request)
+    return {"success": True, "data": results}
+
+
+@app.put("/prontuarios/{prontuario_id}/exames/{exame_id}")
+async def update_exame(
+    prontuario_id: str,
+    exame_id: str,
+    data: ExameUpdate,
+    request: Request,
+    email: str = Depends(verify_doctor),
+):
+    """Update an exam record. Doctor only."""
+    validate_object_id(prontuario_id, "Prontuário")
+    exame_oid = validate_object_id(exame_id, "Exame")
+    update_fields = {"updated_at": datetime.now(timezone.utc)}
+    for field_name in ["tipo_exame", "descricao", "interpretacao", "data_exame", "profissional_responsavel"]:
+        value = getattr(data, field_name, None)
+        if value is not None:
+            update_fields[field_name] = value
+
+    result = await db.exames.update_one(
+        {"_id": exame_oid, "prontuario_id": prontuario_id},
+        {"$set": update_fields},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Exame not found")
+    await log_access(email, "UPDATE_EXAME", prontuario_id, f"exame={exame_id}", request)
     return {"success": True}
+
+
+@app.delete("/prontuarios/{prontuario_id}/exames/{exame_id}")
+async def delete_exame(
+    prontuario_id: str,
+    exame_id: str,
+    request: Request,
+    email: str = Depends(verify_doctor),
+):
+    """Exame deletion is PROHIBITED. Clinical data must be retained."""
+    await log_access(email, "DELETE_EXAME_BLOCKED", prontuario_id,
+                     f"Deletion attempt blocked for exame={exame_id}", request)
+    raise HTTPException(
+        status_code=403,
+        detail="Exclusão de exames é proibida. Dados clínicos devem ser mantidos conforme legislação vigente."
+    )
+
+
+# --- CID-10 (International Classification of Diseases) ---
+
+CID10_DATA = [
+    {"codigo": "A00", "descricao": "Cólera"},
+    {"codigo": "A01", "descricao": "Febres tifóide e paratifóide"},
+    {"codigo": "A09", "descricao": "Diarreia e gastroenterite de origem infecciosa presumível"},
+    {"codigo": "A15", "descricao": "Tuberculose respiratória"},
+    {"codigo": "A90", "descricao": "Dengue"},
+    {"codigo": "B15", "descricao": "Hepatite aguda A"},
+    {"codigo": "B24", "descricao": "Doença pelo vírus da imunodeficiência humana (HIV)"},
+    {"codigo": "B34", "descricao": "Infecção viral não especificada"},
+    {"codigo": "C50", "descricao": "Neoplasia maligna da mama"},
+    {"codigo": "C61", "descricao": "Neoplasia maligna da próstata"},
+    {"codigo": "D50", "descricao": "Anemia por deficiência de ferro"},
+    {"codigo": "E10", "descricao": "Diabetes mellitus insulino-dependente (Tipo 1)"},
+    {"codigo": "E11", "descricao": "Diabetes mellitus não insulino-dependente (Tipo 2)"},
+    {"codigo": "E66", "descricao": "Obesidade"},
+    {"codigo": "E78", "descricao": "Distúrbios do metabolismo de lipoproteínas (Dislipidemia)"},
+    {"codigo": "F10", "descricao": "Transtornos mentais por uso de álcool"},
+    {"codigo": "F20", "descricao": "Esquizofrenia"},
+    {"codigo": "F31", "descricao": "Transtorno afetivo bipolar"},
+    {"codigo": "F32", "descricao": "Episódio depressivo"},
+    {"codigo": "F41", "descricao": "Outros transtornos ansiosos"},
+    {"codigo": "G40", "descricao": "Epilepsia"},
+    {"codigo": "G43", "descricao": "Enxaqueca"},
+    {"codigo": "H10", "descricao": "Conjuntivite"},
+    {"codigo": "H66", "descricao": "Otite média supurativa e não especificada"},
+    {"codigo": "I10", "descricao": "Hipertensão essencial (primária)"},
+    {"codigo": "I20", "descricao": "Angina pectoris"},
+    {"codigo": "I21", "descricao": "Infarto agudo do miocárdio"},
+    {"codigo": "I50", "descricao": "Insuficiência cardíaca"},
+    {"codigo": "I64", "descricao": "Acidente vascular cerebral (AVC)"},
+    {"codigo": "J00", "descricao": "Nasofaringite aguda (Resfriado comum)"},
+    {"codigo": "J02", "descricao": "Faringite aguda"},
+    {"codigo": "J03", "descricao": "Amigdalite aguda"},
+    {"codigo": "J06", "descricao": "Infecções agudas das vias aéreas superiores"},
+    {"codigo": "J11", "descricao": "Influenza (Gripe)"},
+    {"codigo": "J18", "descricao": "Pneumonia"},
+    {"codigo": "J30", "descricao": "Rinite alérgica e vasomotora"},
+    {"codigo": "J45", "descricao": "Asma"},
+    {"codigo": "K21", "descricao": "Doença de refluxo gastroesofágico"},
+    {"codigo": "K25", "descricao": "Úlcera gástrica"},
+    {"codigo": "K29", "descricao": "Gastrite e duodenite"},
+    {"codigo": "K35", "descricao": "Apendicite aguda"},
+    {"codigo": "K40", "descricao": "Hérnia inguinal"},
+    {"codigo": "K80", "descricao": "Colelitíase (Pedra na vesícula)"},
+    {"codigo": "L20", "descricao": "Dermatite atópica"},
+    {"codigo": "L50", "descricao": "Urticária"},
+    {"codigo": "M15", "descricao": "Poliartrose"},
+    {"codigo": "M25", "descricao": "Outros transtornos articulares"},
+    {"codigo": "M54", "descricao": "Dorsalgia (Dor nas costas)"},
+    {"codigo": "M79", "descricao": "Reumatismo não especificado (Fibromialgia)"},
+    {"codigo": "N10", "descricao": "Nefrite túbulo-intersticial aguda (Infecção renal)"},
+    {"codigo": "N20", "descricao": "Cálculo do rim e do ureter (Pedra nos rins)"},
+    {"codigo": "N30", "descricao": "Cistite (Infecção urinária)"},
+    {"codigo": "N39", "descricao": "Outros transtornos do trato urinário"},
+    {"codigo": "N76", "descricao": "Outras inflamações da vagina e vulva"},
+    {"codigo": "O80", "descricao": "Parto único espontâneo"},
+    {"codigo": "R05", "descricao": "Tosse"},
+    {"codigo": "R10", "descricao": "Dor abdominal e pélvica"},
+    {"codigo": "R11", "descricao": "Náusea e vômitos"},
+    {"codigo": "R50", "descricao": "Febre de origem desconhecida"},
+    {"codigo": "R51", "descricao": "Cefaleia (Dor de cabeça)"},
+    {"codigo": "S00", "descricao": "Traumatismo superficial da cabeça"},
+    {"codigo": "S52", "descricao": "Fratura do antebraço"},
+    {"codigo": "S82", "descricao": "Fratura da perna, incluindo tornozelo"},
+    {"codigo": "T14", "descricao": "Traumatismo de região não especificada"},
+    {"codigo": "T78", "descricao": "Efeitos adversos não classificados em outra parte (Alergia)"},
+    {"codigo": "Z00", "descricao": "Exame geral e investigação (Check-up)"},
+    {"codigo": "Z01", "descricao": "Outros exames especiais e investigações"},
+    {"codigo": "Z34", "descricao": "Supervisão de gravidez normal"},
+    {"codigo": "Z76", "descricao": "Pessoas em contato com serviços de saúde (Atestado)"},
+]
+
+
+@app.get("/cid10")
+async def list_cid10(q: Optional[str] = None):
+    """List CID-10 codes with optional search/autocomplete. Public endpoint."""
+    if q:
+        q_lower = q.lower()
+        filtered = [c for c in CID10_DATA
+                    if q_lower in c["codigo"].lower() or q_lower in c["descricao"].lower()]
+        return {"success": True, "data": filtered}
+    return {"success": True, "data": CID10_DATA}
+
+
+# --- Retificação (Correction without altering original) ---
+
+@app.post("/prontuarios/{prontuario_id}/retificacao")
+async def create_retificacao(
+    prontuario_id: str,
+    data: EvolucaoCreate,
+    request: Request,
+    email: str = Depends(verify_doctor),
+):
+    """Create a retification record for a locked prontuario. Does not alter the original."""
+    oid = validate_object_id(prontuario_id, "Prontuário")
+    pront = await db.prontuarios.find_one({"_id": oid})
+    if not pront:
+        raise HTTPException(status_code=404, detail="Prontuario not found")
+
+    doc = {
+        "prontuario_id": prontuario_id,
+        "patient_id": data.patient_id,
+        "doctor_id": email,
+        "descricao": data.descricao,
+        "tipo": "retificacao",
+        "referencia_id": prontuario_id,
+        "created_at": datetime.now(timezone.utc),
+        "integrity_hash": hashlib.sha256(data.descricao.encode("utf-8")).hexdigest(),
+    }
+    result = await db.evolucoes.insert_one(doc)
+    await log_access(email, "CREATE_RETIFICACAO", prontuario_id, f"retificacao_id={result.inserted_id}", request)
+    return {"success": True, "id": str(result.inserted_id)}
+
+
+# --- Integrity Verification ---
+
+@app.get("/prontuarios/{prontuario_id}/verify")
+async def verify_integrity(
+    prontuario_id: str,
+    request: Request,
+    email: str = Depends(verify_doctor),
+):
+    """Verify the integrity hash of a prontuario to detect tampering. Doctor only."""
+    oid = validate_object_id(prontuario_id, "Prontuário")
+    doc = await db.prontuarios.find_one({"_id": oid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Prontuario not found")
+
+    stored_hash = doc.get("integrity_hash", "")
+    computed_hash = compute_integrity_hash(doc)
+    is_valid = stored_hash == computed_hash
+
+    await log_access(email, "VERIFY_INTEGRITY", prontuario_id,
+                     f"valid={is_valid}", request)
+    return {
+        "success": True,
+        "valid": is_valid,
+        "stored_hash": stored_hash,
+        "computed_hash": computed_hash,
+    }
 
 
 @app.post("/prontuarios/{prontuario_id}/upload")
