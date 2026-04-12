@@ -235,6 +235,14 @@ class ExameCreate(BaseModel):
     profissional_responsavel: Optional[str] = ""
 
 
+class ExameUpdate(BaseModel):
+    tipo_exame: Optional[str] = None
+    descricao: Optional[str] = None
+    interpretacao: Optional[str] = None
+    data_exame: Optional[str] = None
+    profissional_responsavel: Optional[str] = None
+
+
 # --- Helpers ---
 def generate_user_fernet_key() -> str:
     """Generate a unique Fernet key for a new user."""
@@ -333,6 +341,15 @@ def is_editable(created_at: datetime) -> bool:
     if created_at.tzinfo is None:
         created_at = created_at.replace(tzinfo=timezone.utc)
     return now.date() == created_at.date()
+
+
+def validate_object_id(id_str: str, entity_name: str = "Record") -> ObjectId:
+    """Validate and convert a string to ObjectId, raising 400 if invalid."""
+    from bson.errors import InvalidId
+    try:
+        return ObjectId(id_str)
+    except (InvalidId, TypeError):
+        raise HTTPException(status_code=400, detail=f"ID inválido para {entity_name}: {id_str}")
 
 
 def check_subscription(user: dict) -> tuple[bool, str]:
@@ -1508,7 +1525,8 @@ async def create_evolucao(
 ):
     """Add a medical evolution to a prontuario. Append-only, cannot be edited or deleted."""
     # Verify prontuario exists
-    pront = await db.prontuarios.find_one({"_id": ObjectId(prontuario_id)})
+    oid = validate_object_id(prontuario_id, "Prontuário")
+    pront = await db.prontuarios.find_one({"_id": oid})
     if not pront:
         raise HTTPException(status_code=404, detail="Prontuario not found")
 
@@ -1562,7 +1580,8 @@ async def create_exame(
     email: str = Depends(verify_doctor),
 ):
     """Add an exam record to a prontuario. Doctor only."""
-    pront = await db.prontuarios.find_one({"_id": ObjectId(prontuario_id)})
+    oid = validate_object_id(prontuario_id, "Prontuário")
+    pront = await db.prontuarios.find_one({"_id": oid})
     if not pront:
         raise HTTPException(status_code=404, detail="Prontuario not found")
 
@@ -1616,29 +1635,21 @@ async def list_exames(
 async def update_exame(
     prontuario_id: str,
     exame_id: str,
+    data: ExameUpdate,
     request: Request,
-    tipo_exame: Optional[str] = None,
-    descricao: Optional[str] = None,
-    interpretacao: Optional[str] = None,
-    data_exame: Optional[str] = None,
-    profissional_responsavel: Optional[str] = None,
     email: str = Depends(verify_doctor),
 ):
     """Update an exam record. Doctor only."""
+    validate_object_id(prontuario_id, "Prontuário")
+    exame_oid = validate_object_id(exame_id, "Exame")
     update_fields = {"updated_at": datetime.now(timezone.utc)}
-    if tipo_exame is not None:
-        update_fields["tipo_exame"] = tipo_exame
-    if descricao is not None:
-        update_fields["descricao"] = descricao
-    if interpretacao is not None:
-        update_fields["interpretacao"] = interpretacao
-    if data_exame is not None:
-        update_fields["data_exame"] = data_exame
-    if profissional_responsavel is not None:
-        update_fields["profissional_responsavel"] = profissional_responsavel
+    for field_name in ["tipo_exame", "descricao", "interpretacao", "data_exame", "profissional_responsavel"]:
+        value = getattr(data, field_name, None)
+        if value is not None:
+            update_fields[field_name] = value
 
     result = await db.exames.update_one(
-        {"_id": ObjectId(exame_id), "prontuario_id": prontuario_id},
+        {"_id": exame_oid, "prontuario_id": prontuario_id},
         {"$set": update_fields},
     )
     if result.matched_count == 0:
@@ -1654,12 +1665,13 @@ async def delete_exame(
     request: Request,
     email: str = Depends(verify_doctor),
 ):
-    """Delete an exam record. Doctor only."""
-    result = await db.exames.delete_one({"_id": ObjectId(exame_id), "prontuario_id": prontuario_id})
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Exame not found")
-    await log_access(email, "DELETE_EXAME", prontuario_id, f"exame={exame_id}", request)
-    return {"success": True}
+    """Exame deletion is PROHIBITED. Clinical data must be retained."""
+    await log_access(email, "DELETE_EXAME_BLOCKED", prontuario_id,
+                     f"Deletion attempt blocked for exame={exame_id}", request)
+    raise HTTPException(
+        status_code=403,
+        detail="Exclusão de exames é proibida. Dados clínicos devem ser mantidos conforme legislação vigente."
+    )
 
 
 # --- CID-10 (International Classification of Diseases) ---
@@ -1758,7 +1770,8 @@ async def create_retificacao(
     email: str = Depends(verify_doctor),
 ):
     """Create a retification record for a locked prontuario. Does not alter the original."""
-    pront = await db.prontuarios.find_one({"_id": ObjectId(prontuario_id)})
+    oid = validate_object_id(prontuario_id, "Prontuário")
+    pront = await db.prontuarios.find_one({"_id": oid})
     if not pront:
         raise HTTPException(status_code=404, detail="Prontuario not found")
 
@@ -1786,7 +1799,8 @@ async def verify_integrity(
     email: str = Depends(verify_doctor),
 ):
     """Verify the integrity hash of a prontuario to detect tampering. Doctor only."""
-    doc = await db.prontuarios.find_one({"_id": ObjectId(prontuario_id)})
+    oid = validate_object_id(prontuario_id, "Prontuário")
+    doc = await db.prontuarios.find_one({"_id": oid})
     if not doc:
         raise HTTPException(status_code=404, detail="Prontuario not found")
 
