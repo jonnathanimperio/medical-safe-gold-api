@@ -23,7 +23,7 @@ from fastapi.responses import Response, HTMLResponse
 from jose import jwt, JWTError
 import mercadopago
 from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 # --- Configuration ---
 MONGO_URI = os.environ.get("MONGO_URI", "")
@@ -98,6 +98,11 @@ async def startup_db():
     await db.confirmacoes.create_index("uuid", unique=True)
     await db.confirmacoes.create_index("clinica_id")
     await db.confirmacoes.create_index("appointment_id")
+    # Exames indexes
+    await db.exames.create_index("prontuario_id")
+    await db.exames.create_index("tipo_exame")
+    await db.exames.create_index([("prontuario_id", 1), ("tipo_exame", 1)])
+    await db.exames.create_index("created_at")
 
 
 @app.on_event("shutdown")
@@ -233,6 +238,17 @@ class ExameCreate(BaseModel):
     interpretacao: Optional[str] = ""
     data_exame: Optional[str] = ""
     profissional_responsavel: Optional[str] = ""
+    
+    @field_validator('data_exame')
+    @classmethod
+    def validate_data_exame(cls, v):
+        """Validate exam date format (YYYY-MM-DD)"""
+        if v and v.strip():
+            try:
+                datetime.strptime(v, '%Y-%m-%d')
+            except ValueError:
+                raise ValueError('data_exame must be in format YYYY-MM-DD')
+        return v
 
 
 class ExameUpdate(BaseModel):
