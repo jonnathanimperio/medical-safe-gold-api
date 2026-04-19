@@ -1558,7 +1558,16 @@ async def create_evolucao(
         raise HTTPException(status_code=404, detail="Prontuario not found")
 
     # Accept 'texto' as alias for 'descricao' (frontend sends 'texto')
-    descricao = data.descricao or data.texto or ""
+    # If encrypted, store the encrypted payload; otherwise store the plain text
+    if data.encrypted:
+        # Frontend sends encrypted data - store as-is
+        descricao = data.texto or ""  # encrypted payload
+        texto_to_store = descricao
+    else:
+        # Plain text data
+        descricao = data.descricao or data.texto or ""
+        texto_to_store = descricao
+    
     patient_id = data.patient_id or str(pront.get("patient_id", ""))
 
     doc = {
@@ -1566,7 +1575,8 @@ async def create_evolucao(
         "patient_id": patient_id,
         "doctor_id": email,
         "descricao": descricao,
-        "texto": descricao,  # Store both for frontend compatibility
+        "texto": texto_to_store,
+        "encrypted": data.encrypted or False,  # Store encryption flag
         "created_by": email,
         "tipo": data.tipo or "evolucao",
         "referencia_id": data.referencia_id or "",
@@ -1594,6 +1604,8 @@ async def list_evolucoes(
             "patient_id": doc.get("patient_id", ""),
             "doctor_id": doc["doctor_id"],
             "descricao": doc["descricao"],
+            "texto": doc.get("texto", doc["descricao"]),  # Return encrypted or plain text
+            "encrypted": doc.get("encrypted", False),  # Return encryption flag
             "tipo": doc.get("tipo", "evolucao"),
             "referencia_id": doc.get("referencia_id", ""),
             "integrity_hash": doc.get("integrity_hash", ""),
