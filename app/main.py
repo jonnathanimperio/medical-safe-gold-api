@@ -218,16 +218,27 @@ class ProntuarioUpdate(BaseModel):
 
 
 class EvolucaoCreate(BaseModel):
-    prontuario_id: str
-    patient_id: str
-    descricao: str
+    prontuario_id: Optional[str] = ""  # Optional - taken from URL path
+    patient_id: Optional[str] = ""  # Optional - looked up from prontuario
+    descricao: Optional[str] = ""  # Main text field
+    texto: Optional[str] = ""  # Alias accepted from frontend
     tipo: Optional[str] = "evolucao"  # evolucao, retificacao
     referencia_id: Optional[str] = None  # ID of original record for retificacao
+    encrypted: Optional[bool] = False  # Whether the data is encrypted
+
+
+class RetificacaoCreate(BaseModel):
+    motivo: str = ""
+    campo: str = ""
+    valor_corrigido: str = ""
+    descricao: Optional[str] = ""  # Fallback
+    prontuario_id: Optional[str] = ""
+    patient_id: Optional[str] = ""
 
 
 class ExameCreate(BaseModel):
-    prontuario_id: str
-    patient_id: str
+    prontuario_id: Optional[str] = ""  # Optional - taken from URL path
+    patient_id: Optional[str] = ""  # Optional - looked up from prontuario
     tipo_exame: str  # e.g. "Hemograma", "Glicemia", etc.
     descricao: Optional[str] = ""
     interpretacao: Optional[str] = ""
@@ -1530,15 +1541,21 @@ async def create_evolucao(
     if not pront:
         raise HTTPException(status_code=404, detail="Prontuario not found")
 
+    # Accept 'texto' as alias for 'descricao' (frontend sends 'texto')
+    descricao = data.descricao or data.texto or ""
+    patient_id = data.patient_id or str(pront.get("patient_id", ""))
+
     doc = {
         "prontuario_id": prontuario_id,
-        "patient_id": data.patient_id,
+        "patient_id": patient_id,
         "doctor_id": email,
-        "descricao": data.descricao,
+        "descricao": descricao,
+        "texto": descricao,  # Store both for frontend compatibility
+        "created_by": email,
         "tipo": data.tipo or "evolucao",
         "referencia_id": data.referencia_id or "",
         "created_at": datetime.now(timezone.utc),
-        "integrity_hash": hashlib.sha256(data.descricao.encode("utf-8")).hexdigest(),
+        "integrity_hash": hashlib.sha256(descricao.encode("utf-8")).hexdigest(),
     }
     result = await db.evolucoes.insert_one(doc)
     await log_access(email, "CREATE_EVOLUCAO", prontuario_id, f"tipo={data.tipo}", request)
@@ -1585,9 +1602,12 @@ async def create_exame(
     if not pront:
         raise HTTPException(status_code=404, detail="Prontuario not found")
 
+    # Use patient_id from body or look up from prontuario
+    patient_id = data.patient_id or str(pront.get("patient_id", ""))
+
     doc = {
         "prontuario_id": prontuario_id,
-        "patient_id": data.patient_id,
+        "patient_id": patient_id,
         "doctor_id": email,
         "tipo_exame": data.tipo_exame,
         "descricao": data.descricao or "",
@@ -1765,7 +1785,7 @@ async def list_cid10(q: Optional[str] = None):
 @app.post("/prontuarios/{prontuario_id}/retificacao")
 async def create_retificacao(
     prontuario_id: str,
-    data: EvolucaoCreate,
+    data: RetificacaoCreate,
     request: Request,
     email: str = Depends(verify_doctor),
 ):
@@ -1775,15 +1795,22 @@ async def create_retificacao(
     if not pront:
         raise HTTPException(status_code=404, detail="Prontuario not found")
 
+    # Build description from retificacao fields (frontend sends motivo/campo/valor_corrigido)
+    descricao = data.descricao or f"Campo: {data.campo} | Motivo: {data.motivo} | Valor corrigido: {data.valor_corrigido}"
+    patient_id = data.patient_id or str(pront.get("patient_id", ""))
+
     doc = {
         "prontuario_id": prontuario_id,
-        "patient_id": data.patient_id,
+        "patient_id": patient_id,
         "doctor_id": email,
-        "descricao": data.descricao,
+        "descricao": descricao,
+        "motivo": data.motivo,
+        "campo": data.campo,
+        "valor_corrigido": data.valor_corrigido,
         "tipo": "retificacao",
         "referencia_id": prontuario_id,
         "created_at": datetime.now(timezone.utc),
-        "integrity_hash": hashlib.sha256(data.descricao.encode("utf-8")).hexdigest(),
+        "integrity_hash": hashlib.sha256(descricao.encode("utf-8")).hexdigest(),
     }
     result = await db.evolucoes.insert_one(doc)
     await log_access(email, "CREATE_RETIFICACAO", prontuario_id, f"retificacao_id={result.inserted_id}", request)
@@ -1813,6 +1840,7 @@ async def verify_integrity(
     return {
         "success": True,
         "valid": is_valid,
+        "integrity_valid": is_valid,
         "stored_hash": stored_hash,
         "computed_hash": computed_hash,
     }
